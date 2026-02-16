@@ -33,17 +33,19 @@ function M.sessions()
 
   -- Find opencode processes and match with ports
   local ret = {} ---@type sidekick.cli.session.State[]
+  local procs = Procs.new()
+  local re = vim.regex("\\<opencode\\>")
 
   for pid, port in pairs(ports) do
-    local proc = vim.api.nvim_get_proc(pid)
-    if proc and proc.name == "opencode" then
+    local proc = procs:get(pid)
+    if proc and re:match_str(proc.cmd) then
       ret[#ret + 1] = {
         id = "opencode-" .. pid,
         pid = pid,
         tool = "opencode",
-        cwd = Procs.cwd(pid) or "",
+        cwd = proc.cwd or "",
         port = port,
-        pids = Procs.pids(pid),
+        pids = procs:pids(pid),
         mux_session = tostring(pid),
         base_url = ("http://localhost:%d"):format(port),
       }

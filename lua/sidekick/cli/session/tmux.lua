@@ -134,7 +134,7 @@ function M.sessions()
     procs:walk(pane.pid, function(proc)
       for _, tool in pairs(tools) do
         if tool:is_proc(proc) then
-          local pids = Procs.pids(pane.pid)
+          local pids = procs:pids(pane.pid)
           vim.list_extend(pids, clients[pane.session_id] or {})
           ret[#ret + 1] = {
             id = pane.skid,
