@@ -173,6 +173,21 @@ function P:list()
   return vim.tbl_values(self._procs)
 end
 
+--- Get all descendant pids of the given pid, including itself,
+--- using the cached process tree.
+---@param pid number
+---@return integer[]
+function P:pids(pid)
+  local ret = {} ---@type integer[]
+  local todo = { pid }
+  while #todo > 0 do
+    local current = table.remove(todo, 1)
+    ret[#ret + 1] = current
+    vim.list_extend(todo, self._children[current] or {})
+  end
+  return ret
+end
+
 ---@param pid number
 function P:children(pid)
   local children = self._children[pid] or {}
