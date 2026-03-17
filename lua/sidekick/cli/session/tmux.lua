@@ -35,6 +35,7 @@ function M:start()
     self:add_cmd(cmd)
     vim.list_extend(cmd, { ";", "set-option", "status", "off" })
     vim.list_extend(cmd, { ";", "set-option", "detach-on-destroy", "on" })
+    Util.set_state(self.sid, { tool = self.tool.name, cwd = self.cwd })
     return { cmd = cmd }
   elseif Config.cli.mux.create == "window" then
     local cmd = { "tmux", "new-window", "-dP", "-c", self.cwd, "-F", PANE_FORMAT }
@@ -63,6 +64,7 @@ function M:spawn(cmd)
     self.mux_session = pane.session_name
     self.tmux_pid = pane.pid
     self.started = true
+    Util.set_state(self.id, { tool = self.tool.name, cwd = self.cwd })
   end
 end
 
@@ -131,24 +133,40 @@ function M.sessions()
   local Procs = require("sidekick.cli.procs")
   local procs = Procs.new()
   for _, pane in ipairs(panes) do
-    procs:walk(pane.pid, function(proc)
-      for _, tool in pairs(tools) do
-        if tool:is_proc(proc) then
-          local pids = procs:pids(pane.pid)
-          vim.list_extend(pids, clients[pane.session_id] or {})
-          ret[#ret + 1] = {
-            id = pane.skid,
-            cwd = proc.cwd or pane.cwd,
-            tool = tool,
-            tmux_pane_id = pane.id,
-            tmux_pid = pane.pid,
-            mux_session = pane.session_name,
-            pids = pids,
-          }
-          return true
+    local state = Util.get_state(pane.skid) or Util.get_state(pane.session_name)
+    if state and tools[state.tool] then
+      local tool = tools[state.tool]
+      local pids = procs:pids(pane.pid)
+      vim.list_extend(pids, clients[pane.session_id] or {})
+      ret[#ret + 1] = {
+        id = pane.skid,
+        cwd = state.cwd or pane.cwd,
+        tool = tool,
+        tmux_pane_id = pane.id,
+        tmux_pid = pane.pid,
+        mux_session = pane.session_name,
+        pids = pids,
+      }
+    else
+      procs:walk(pane.pid, function(proc)
+        for _, tool in pairs(tools) do
+          if tool:is_proc(proc) then
+            local pids = procs:pids(pane.pid)
+            vim.list_extend(pids, clients[pane.session_id] or {})
+            ret[#ret + 1] = {
+              id = pane.skid,
+              cwd = proc.cwd or pane.cwd,
+              tool = tool,
+              tmux_pane_id = pane.id,
+              tmux_pid = pane.pid,
+              mux_session = pane.session_name,
+              pids = pids,
+            }
+            return true
+          end
         end
-      end
-    end)
+      end)
+    end
   end
 
   return ret
