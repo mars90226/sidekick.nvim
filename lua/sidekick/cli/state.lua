@@ -70,6 +70,7 @@ function M.get(filter)
   filter = filter or {}
   local all = {} ---@type sidekick.cli.State[]
   local sids = {} ---@type table<string, boolean>
+  local cwd = Session.cwd()
   local sessions = filter.attached and Session.attached() or Session.sessions()
 
   for _, s in pairs(sessions) do
@@ -88,7 +89,7 @@ function M.get(filter)
     if not skip then
       local ss = M.get_state(s)
       all[#all + 1] = ss
-      if not ss.external then
+      if not ss.external or s.cwd == cwd then
         sids[s.sid] = true
       end
     end
@@ -105,8 +106,6 @@ function M.get(filter)
       end
     end
   end
-
-  local cwd = Session.cwd()
 
   ---@type sidekick.cli.State[]
   ---@param t sidekick.cli.State
@@ -144,6 +143,7 @@ function M.with(cb, opts)
   opts = opts or {}
   cb = vim.schedule_wrap(cb)
   local target_current_cwd = opts.filter and opts.filter.name ~= nil and opts.filter.cwd == nil
+  local cwd = Session.cwd()
 
   ---@param state sidekick.cli.State
   local use = vim.schedule_wrap(function(state)
@@ -158,9 +158,28 @@ function M.with(cb, opts)
   local attached = M.get(filter_attached)
 
   if #attached == 0 and opts.attach then
+    if target_current_cwd then
+      local current = M.get(Util.merge(opts.filter, { cwd = true }))
+      local has_current_session = vim.tbl_contains(vim.tbl_map(function(state)
+        return state.session ~= nil
+      end, current), true)
+      local started = M.get(Util.merge(opts.filter, { started = true }))
+      local has_other_session = vim.tbl_contains(vim.tbl_map(function(state)
+        return state.session ~= nil and state.session.cwd ~= cwd
+      end, started), true)
+
+      if has_current_session and #current == 1 then
+        use(current[1])
+        return
+      elseif not has_other_session and #current == 1 then
+        use(current[1])
+        return
+      end
+    end
+
     require("sidekick.cli.ui.select").select({
       auto = true,
-      filter = Util.merge(opts.filter, target_current_cwd and { cwd = true } or nil),
+      filter = target_current_cwd and opts.filter or Util.merge(opts.filter, target_current_cwd and { cwd = true } or nil),
       cb = use,
     })
   elseif #attached > 1 and not opts.all then
