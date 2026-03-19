@@ -36,7 +36,7 @@ local M = {}
 function M.is(t, filter)
   filter = filter or {}
   return (filter.attached == nil or filter.attached == t.attached)
-    and (filter.cwd == nil or (t.session and t.session.cwd == Session.cwd()))
+    and (filter.cwd == nil or (not t.session or t.session.cwd == Session.cwd()))
     and (filter.external == nil or filter.external == t.external)
     and (filter.installed == nil or filter.installed == t.installed)
     and (filter.name == nil or filter.name == t.tool.name)
@@ -143,6 +143,7 @@ end
 function M.with(cb, opts)
   opts = opts or {}
   cb = vim.schedule_wrap(cb)
+  local target_current_cwd = opts.filter and opts.filter.name ~= nil and opts.filter.cwd == nil
 
   ---@param state sidekick.cli.State
   local use = vim.schedule_wrap(function(state)
@@ -153,13 +154,13 @@ function M.with(cb, opts)
     cb(ret, attached)
   end)
 
-  local filter_attached = Util.merge(opts.filter, { attached = true })
+  local filter_attached = Util.merge(opts.filter, { attached = true }, target_current_cwd and { cwd = true } or nil)
   local attached = M.get(filter_attached)
 
   if #attached == 0 and opts.attach then
     require("sidekick.cli.ui.select").select({
       auto = true,
-      filter = opts.filter,
+      filter = Util.merge(opts.filter, target_current_cwd and { cwd = true } or nil),
       cb = use,
     })
   elseif #attached > 1 and not opts.all then
