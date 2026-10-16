@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+task_mini_path="${SIDEKICK_MINI_TEST:-${XDG_DATA_HOME:-$HOME/.local/share}/nvim/lazy/mini.nvim}"
+test -f "$task_mini_path/lua/mini/test.lua"
+test -x tests/fixtures/herdr
+task_fixture_dir="$(mktemp -d /tmp/sidekick-herdr-fixture.XXXXXX)"
+printf 'Mock evidence directory: %s\n' "$task_fixture_dir"
+export SIDEKICK_MINI_TEST="$task_mini_path"
+export SIDEKICK_HERDR_FIXTURE="$task_fixture_dir"
+export PATH="$PWD/tests/fixtures:$PATH"
+test "$(command -v herdr)" = "$PWD/tests/fixtures/herdr"
+export XDG_STATE_HOME="$task_fixture_dir/state"
+export XDG_DATA_HOME="$task_fixture_dir/data"
+export XDG_CONFIG_HOME="$task_fixture_dir/config"
+exec nvim --headless -u NONE -c 'lua dofile("tests/run_herdr_poc.lua")'

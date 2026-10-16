@@ -96,6 +96,12 @@ function M.format(state, picker)
     -- Keep this for debugging purposes
     -- ret[#ret + 1] = { table.concat(state.session.pids or {}, ",") }
 
+    local parent = state.session.parent or state.session
+    if parent.agent_name or parent.binding then
+      ret[#ret + 1] = { " " .. (parent.agent_name or parent.binding.terminal), "Special" }
+      ret[#ret + 1] = { " (" .. tostring(parent.agent_status) .. ")" }
+    end
+
     local backends = {} ---@type string[]
     backends[#backends + 1] = state.session.mux_backend or state.session.backend
     if state.external then

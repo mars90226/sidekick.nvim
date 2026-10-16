@@ -121,9 +121,10 @@ function M.setup()
   end
   M.did_setup = true
   Config.tools() -- load tools, since they may register session backends
-  local session_backends = { tmux = "sidekick.cli.session.tmux", zellij = "sidekick.cli.session.zellij" }
+  local session_backends =
+    { tmux = "sidekick.cli.session.tmux", zellij = "sidekick.cli.session.zellij", herdr = "sidekick.cli.session.herdr" }
   for name, mod in pairs(session_backends) do
-    if vim.fn.executable(name) == 1 then
+    if vim.fn.executable(name) == 1 and (name ~= "herdr" or Config.cli.mux.backend == "herdr") then
       M.register(name, require(mod))
     end
   end
@@ -182,7 +183,9 @@ function M.attach(session)
     session = M.new({
       tool = session.tool:clone({ cmd = cmd.cmd, env = cmd.env }),
       cwd = session.cwd,
-      id = "terminal: " .. session.sid,
+      id = "terminal: " .. session.id,
+      source_id = session.id,
+      manual_input = session.manual_input,
       backend = "terminal",
       mux_backend = session.backend,
       mux_session = session.mux_session,

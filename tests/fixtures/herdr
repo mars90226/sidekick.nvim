@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Mock CLI: never invokes herdr or any AI executable."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+import termios
+import tty
+
+root = Path(os.environ["SIDEKICK_HERDR_FIXTURE"])
+args = sys.argv[1:]
+with (root / "calls").open("a") as stream:
+    stream.write(json.dumps(args) + "\n")
+state = json.loads((root / "state.json").read_text())
+if args[:1] == ["--session"]:
+    assert args[1] == "poc", "fixture forbids other servers"
+    args = args[2:]
+if args == ["--version"]:
+    print("herdr 0.9.5")
+elif args == ["session", "list", "--json"]:
+    print(json.dumps({"sessions": state["sessions"]}))
+elif args == ["status", "server", "--json"]:
+    print(json.dumps({"socket": state["socket"]}))
+elif args == ["api", "snapshot"]:
+    print(json.dumps({"result": {"snapshot": state["snapshot"]}}))
+elif args[:2] == ["agent", "get"]:
+    agents = [a for a in state["snapshot"]["agents"] if a["pane_id"] == args[2]]
+    print(json.dumps({"result": {"agent": agents[0]}}) if agents else '{"error":{"code":"not_found"}}')
+elif args[:3] == ["pane", "process-info", "--pane"]:
+    print(json.dumps({"result": {"process_info": {"foreground_process_group_id": state.get("process_group"), "shell_pid": 0}}}))
+elif args[:2] == ["agent", "attach"]:
+    assert len(args) == 3, "fixture forbids takeover"
+    lock = (root / (args[2].replace(":", "_") + ".lock")).open("w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("mock input ownership conflict", file=sys.stderr)
+        sys.exit(23)
+    (root / "owner.pid").write_text(str(os.getpid()))
+    old = termios.tcgetattr(0)
+    tty.setraw(0)
+    def size(*_):
+        with (root / "sizes").open("a") as stream:
+            stream.write(str(os.get_terminal_size(0)) + "\n")
+    signal.signal(signal.SIGWINCH, size)
+    size()
+    os.write(1, b"MOCK ATTACHED\r\n")
+    try:
+        while True:
+            data = os.read(0, 4096)
+            if not data:
+                break
+            with (root / "input").open("ab") as stream:
+                stream.write(data)
+            os.write(1, data)
+    finally:
+        termios.tcsetattr(0, termios.TCSANOW, old)
+else:
+    raise RuntimeError("forbidden mock command: " + repr(args))

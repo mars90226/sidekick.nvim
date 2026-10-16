@@ -148,6 +148,10 @@ function M:start()
   if self:is_running() then
     return
   end
+  if self.manual_input then
+    assert(not self.closed and not self.job, "Herdr attachment ended; select the agent again")
+    assert(self.parent:validate(), "Herdr target changed; select the agent again")
+  end
 
   self.buf = vim.api.nvim_create_buf(false, true)
   self:bo()
@@ -412,6 +416,10 @@ function M:is_focused()
 end
 
 function M:show()
+  if self.manual_input and not self.parent:validate() then
+    self:close()
+    error("Herdr occupant changed or became unavailable; select the agent again")
+  end
   self:start()
   if not self:is_running() then
     return
@@ -452,6 +460,7 @@ function M:close()
     return self
   end
   self.closed = true
+  self.send_queue = {}
 
   M.terminals[self.id] = nil
   if vim.tbl_isempty(M.terminals) then
@@ -491,6 +500,10 @@ end
 
 ---@param input string
 function M:send(input)
+  if self.manual_input then
+    Util.warn("Herdr PoC: use manual terminal input; automatic paste and submit are disabled")
+    return
+  end
   self:show()
   if not self:is_running() then
     return
@@ -511,6 +524,9 @@ function M:keys(buf)
   local Actions = require("sidekick.cli.actions")
   ---@type table<string, sidekick.cli.Keymap|false>
   local keys = vim.tbl_extend("force", {}, self.opts.keys, self.tool.keys or {})
+  if self.manual_input then
+    keys.buffers = false
+  end
   for name, km in pairs(keys) do
     if type(km) == "table" then
       local lhs, rhs = km[1], km[2] or name
