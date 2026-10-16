@@ -56,7 +56,7 @@ elif len(args) == 4 and args[:3] == ["pane", "process-info", "--pane"] and scope
     info = state.get("processes", {}).get(args[3], {})
     reply({"result": {"process_info": {
         "foreground_process_group_id": info.get("group", state.get("process_group")),
-        "shell_pid": info.get("shell_pid", state.get("shell_pid", 0))}}})
+        "shell_pid": info.get("shell_pid", state.get("shell_pid", 1))}}})
 elif len(args) == 3 and (args[:2] == ["agent", "attach"] and scoped or args[:2] == ["terminal", "attach"] and not scoped):
     if args[0] == "terminal":
         if os.environ.get("HERDR_SOCKET_PATH") != state["socket"] or "HERDR_SESSION" in os.environ:

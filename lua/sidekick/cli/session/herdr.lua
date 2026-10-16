@@ -126,7 +126,16 @@ function M.process_identity(endpoint, pane)
   local reply = M.json({ "pane", "process-info", "--pane", pane }, endpoint.name)
   local info = reply and type(reply.result) == "table" and reply.result.process_info
   local group = type(info) == "table" and info.foreground_process_group_id
-  if type(group) ~= "number" or group <= 0 or group % 1 ~= 0 or group == info.shell_pid then
+  local shell = type(info) == "table" and info.shell_pid
+  if
+    type(group) ~= "number"
+    or group <= 0
+    or group % 1 ~= 0
+    or type(shell) ~= "number"
+    or shell <= 0
+    or shell % 1 ~= 0
+    or group == shell
+  then
     return nil
   end
   local file = io.open("/proc/" .. group .. "/stat", "r")

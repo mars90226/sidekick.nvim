@@ -564,4 +564,29 @@ T["zombie foreground process is not a live agent"] = function()
   expect.equality(#H.sessions(), 1)
 end
 
+for _, bad in ipairs({ vim.NIL, 0, -1, 1.5, "unknown" }) do
+  T["missing or invalid shell identity " .. vim.inspect(bad)] = function()
+    state.shell_pid = bad
+    save(state)
+    expect.equality(H.sessions(), {})
+    expect.equality(#warnings, 1)
+  end
+end
+
+T["attachment does not need the reported agent cwd to exist"] = function()
+  state.snapshot.agents[1].foreground_cwd = root .. "/deleted-agent-cwd"
+  save(state)
+  expect.equality(vim.fn.isdirectory(state.snapshot.agents[1].foreground_cwd), 0)
+  local before = #vim.api.nvim_list_wins()
+  local t = attach()
+  ready(t)
+  expect.equality(t.cwd, state.snapshot.agents[1].foreground_cwd)
+  expect.equality(t:is_running(), true)
+  t:hide()
+  t:show()
+  t:close()
+  expect.equality(Terminal.get(t.id), nil)
+  expect.equality(#vim.api.nvim_list_wins(), before)
+end
+
 return T

@@ -322,7 +322,9 @@ function M:start()
       end
     end
     self.job = vim.fn.jobstart(norm_cmd, {
-      cwd = self.cwd,
+      -- The attached agent may outlive its working directory. Its cwd remains
+      -- session metadata; the local attachment client only needs a valid cwd.
+      cwd = self.manual_input and vim.fn.getcwd(0) or self.cwd,
       term = true,
       clear_env = true,
       env = not vim.tbl_isempty(env) and env or nil,
