@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mock CLI: never invokes herdr or any AI executable."""
+"""Strict mock CLI; never invokes herdr or an AI executable."""
 import fcntl
 import json
 import os
@@ -10,29 +10,64 @@ import termios
 import tty
 
 root = Path(os.environ["SIDEKICK_HERDR_FIXTURE"])
-args = sys.argv[1:]
+original = sys.argv[1:]
 with (root / "calls").open("a") as stream:
-    stream.write(json.dumps(args) + "\n")
+    stream.write(json.dumps(original) + "\n")
 state = json.loads((root / "state.json").read_text())
-if args[:1] == ["--session"]:
-    assert args[1] == "poc", "fixture forbids other servers"
+args = original[:]
+scoped = args[:1] == ["--session"]
+
+
+def forbidden(reason):
+    with (root / "violations").open("a") as stream:
+        stream.write(reason + ": " + json.dumps(original) + "\n")
+    print(reason, file=sys.stderr)
+    sys.exit(97)
+
+
+def reply(value):
+    if state.get("error_null"):
+        value["error"] = None
+    print(json.dumps(value))
+
+
+if scoped:
+    if len(args) < 3 or args[1] != "poc":
+        forbidden("wrong server")
     args = args[2:]
-if args == ["--version"]:
+if args == ["--version"] and not scoped:
     print("herdr 0.9.5")
-elif args == ["session", "list", "--json"]:
-    print(json.dumps({"sessions": state["sessions"]}))
-elif args == ["status", "server", "--json"]:
-    print(json.dumps({"socket": state["socket"]}))
-elif args == ["api", "snapshot"]:
-    print(json.dumps({"result": {"snapshot": state["snapshot"]}}))
-elif args[:2] == ["agent", "get"]:
+elif args == ["session", "list", "--json"] and not scoped:
+    reply({"sessions": state["sessions"]})
+elif args == ["status", "server", "--json"] and scoped:
+    reply({"socket": state["socket"], "running": state.get("server_running", True)})
+elif args == ["api", "snapshot"] and scoped:
+    if state.get("fail_snapshot"):
+        print("synthetic snapshot access denied", file=sys.stderr)
+        sys.exit(3)
+    if state.get("malformed_snapshot"):
+        print("{not-json")
+    else:
+        reply({"result": {"snapshot": state["snapshot"]}})
+elif len(args) == 3 and args[:2] == ["agent", "get"] and scoped:
     agents = [a for a in state["snapshot"]["agents"] if a["pane_id"] == args[2]]
-    print(json.dumps({"result": {"agent": agents[0]}}) if agents else '{"error":{"code":"not_found"}}')
-elif args[:3] == ["pane", "process-info", "--pane"]:
-    print(json.dumps({"result": {"process_info": {"foreground_process_group_id": state.get("process_group"), "shell_pid": 0}}}))
-elif args[:2] == ["agent", "attach"]:
-    assert len(args) == 3, "fixture forbids takeover"
-    lock = (root / (args[2].replace(":", "_") + ".lock")).open("w")
+    reply({"result": {"agent": agents[0]}} if agents else {"error": {"code": "not_found"}})
+elif len(args) == 4 and args[:3] == ["pane", "process-info", "--pane"] and scoped:
+    info = state.get("processes", {}).get(args[3], {})
+    reply({"result": {"process_info": {
+        "foreground_process_group_id": info.get("group", state.get("process_group")),
+        "shell_pid": info.get("shell_pid", state.get("shell_pid", 0))}}})
+elif len(args) == 3 and (args[:2] == ["agent", "attach"] and scoped or args[:2] == ["terminal", "attach"] and not scoped):
+    if args[0] == "terminal":
+        if os.environ.get("HERDR_SOCKET_PATH") != state["socket"] or "HERDR_SESSION" in os.environ:
+            forbidden("attachment was not socket-pinned")
+        matches = [a for a in state["snapshot"]["agents"] if a["terminal_id"] == args[2]]
+        if len(matches) != 1:
+            forbidden("unknown terminal")
+        pane = matches[0]["pane_id"]
+    else:
+        pane = args[2]
+    lock = (root / (pane.replace(":", "_") + ".lock")).open("w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -41,9 +76,11 @@ elif args[:2] == ["agent", "attach"]:
     (root / "owner.pid").write_text(str(os.getpid()))
     old = termios.tcgetattr(0)
     tty.setraw(0)
+
     def size(*_):
         with (root / "sizes").open("a") as stream:
             stream.write(str(os.get_terminal_size(0)) + "\n")
+
     signal.signal(signal.SIGWINCH, size)
     size()
     os.write(1, b"MOCK ATTACHED\r\n")
@@ -58,4 +95,4 @@ elif args[:2] == ["agent", "attach"]:
     finally:
         termios.tcsetattr(0, termios.TCSANOW, old)
 else:
-    raise RuntimeError("forbidden mock command: " + repr(args))
+    forbidden("unsupported or mutating command")

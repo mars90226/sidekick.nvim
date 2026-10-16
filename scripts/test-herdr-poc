@@ -13,4 +13,7 @@ test "$(command -v herdr)" = "$PWD/tests/fixtures/herdr"
 export XDG_STATE_HOME="$task_fixture_dir/state"
 export XDG_DATA_HOME="$task_fixture_dir/data"
 export XDG_CONFIG_HOME="$task_fixture_dir/config"
-exec nvim --headless -u NONE -c 'lua dofile("tests/run_herdr_poc.lua")'
+if [[ "${SIDEKICK_HERDR_KEEP_FIXTURE:-0}" != 1 ]]; then
+  trap 'rm -rf -- "$task_fixture_dir"' EXIT
+fi
+nvim --headless -u NONE -c 'lua dofile("tests/run_herdr_poc.lua")'

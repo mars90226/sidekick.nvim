@@ -15,6 +15,9 @@ M._attached = {} ---@type table<string,sidekick.cli.Session>
 ---@field backend? string
 ---@field started? boolean
 ---@field external? boolean external sessions won't be opened in a terminal
+---@field source_id? string Identity of an already-discovered source hidden by a live wrapper
+---@field manual_input? boolean Disable automatic input; parent must implement validate()
+---@field same_owner? fun(self:sidekick.cli.Session, other:sidekick.cli.Session):boolean
 ---@field parent? sidekick.cli.Session
 ---@field mux_session? string
 ---@field mux_backend? string
@@ -79,7 +82,8 @@ end
 function M.new(state)
   local tool = state.tool
   tool = type(tool) == "string" and Config.get_tool(tool) or tool --[[@as sidekick.cli.Tool]]
-  local backend = state.backend or (Config.cli.mux.enabled and Config.cli.mux.backend or "terminal")
+  local backend = state.backend
+    or ((Config.cli.mux.enabled or Config.cli.mux.backend == "herdr") and Config.cli.mux.backend or "terminal")
   local super = assert(M.backends[backend], "unknown backend: " .. backend)
   local meta = getmetatable(state)
   local self = setmetatable(state, super) --[[@as sidekick.cli.Session]]
@@ -147,6 +151,16 @@ function M.sessions()
       end
     end
   end
+  local sources = {}
+  for _, s in ipairs(ret) do
+    sources[s.id] = s
+  end
+  for _, s in ipairs(ret) do
+    local source = s.source_id and sources[s.source_id]
+    if source and s.parent and s.parent.same_owner and s.parent:same_owner(source) then
+      s.parent, s.cwd, s.sid = source, source.cwd, source.sid
+    end
+  end
   for id in pairs(M._attached) do
     if not ids[id] then -- session is no longer running
       M.detach(M._attached[id])
@@ -174,6 +188,7 @@ function M.attach(session)
   end
   ---@type sidekick.cli.terminal.Cmd?
   local cmd
+  local source_id = session.started and session.id or nil
   if session.started then
     cmd = session:attach()
   else
@@ -184,7 +199,7 @@ function M.attach(session)
       tool = session.tool:clone({ cmd = cmd.cmd, env = cmd.env }),
       cwd = session.cwd,
       id = "terminal: " .. session.id,
-      source_id = session.id,
+      source_id = source_id,
       manual_input = session.manual_input,
       backend = "terminal",
       mux_backend = session.backend,

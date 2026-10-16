@@ -318,8 +318,23 @@ local defaults = {
     ---@class sidekick.cli.Mux
     ---@field backend? "tmux"|"zellij"|"herdr" Multiplexer backend to persist CLI sessions
     mux = {
-      -- Experimental, local Linux: existing agents only; automatic input is disabled.
-      herdr = { session = "default" },
+      -- Experimental herdr attachment: set backend = "herdr" and choose an existing
+      -- running server below. Only existing agents are selectable; enabled does
+      -- not permit creating agents or falling back to a new local tool.
+      -- Requires local Linux with the same /proc namespace, herdr on PATH, and
+      -- identical client/server versions. Agent kinds must match configured tool names.
+      -- Conflicting clients fail without takeover/retry. Closing a client preserves
+      -- the agent; reselect explicitly after a disconnect. Automatic paste/submit
+      -- remains disabled; manual terminal input is available.
+      -- Ownership is checked before attach/show and terminal ID + socket are pinned.
+      -- These checks are not atomic: replacement after a check or while the window
+      -- is already visible may receive manual input. No strict occupant binding is claimed.
+      -- Discovery currently uses bounded synchronous CLI calls and may block the UI.
+      ---@class sidekick.cli.Herdr
+      herdr = {
+        -- Existing running herdr server name, matching letters/digits/_/-.
+        session = "default", ---@type string
+      },
       backend = vim.env.ZELLIJ and "zellij" or "tmux", -- default to tmux unless zellij is detected
       enabled = false,
       -- terminal: new sessions will be created for each CLI tool and shown in a Neovim terminal

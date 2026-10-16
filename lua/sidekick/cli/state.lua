@@ -75,14 +75,14 @@ function M.get(filter)
 
   local sources = {}
   for _, s in pairs(sessions) do
-    if s.source_id then
+    if s.source_id and s:is_running() then
       sources[s.source_id] = true
     end
   end
 
   for _, s in pairs(sessions) do
-    -- if not attached, skip if another session with higher priority
-    -- is running with overlapping pids
+    -- A live wrapper hides its identified source. Otherwise retain the normal
+    -- priority/PID dedupe, including rediscovery after a client exits.
     local skip = sources[s.id] == true
     if not s:is_attached() then
       for _, s2 in pairs(sessions) do
@@ -102,7 +102,7 @@ function M.get(filter)
     end
   end
 
-  if not filter.attached then
+  if not filter.attached and Config.cli.mux.backend ~= "herdr" then
     for name, tool in pairs(Config.tools()) do
       local sid = Session.sid({ tool = name })
       if not sids[sid] then

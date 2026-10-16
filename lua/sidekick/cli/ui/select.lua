@@ -96,10 +96,17 @@ function M.format(state, picker)
     -- Keep this for debugging purposes
     -- ret[#ret + 1] = { table.concat(state.session.pids or {}, ",") }
 
+    local metadata_width = 0
     local parent = state.session.parent or state.session
     if parent.agent_name or parent.binding then
-      ret[#ret + 1] = { " " .. (parent.agent_name or parent.binding.terminal), "Special" }
-      ret[#ret + 1] = { " (" .. tostring(parent.agent_status) .. ")" }
+      local label = " " .. (parent.agent_name or parent.binding.terminal)
+      ret[#ret + 1] = { label, "Special" }
+      metadata_width = metadata_width + sw(label)
+      if type(parent.agent_status) == "string" and parent.agent_status ~= "" then
+        label = " (" .. parent.agent_status .. ")"
+        ret[#ret + 1] = { label }
+        metadata_width = metadata_width + sw(label)
+      end
     end
 
     local backends = {} ---@type string[]
@@ -110,8 +117,8 @@ function M.format(state, picker)
     local backend = ("[%s]"):format(table.concat(backends, ":"))
 
     ret[#ret + 1] = { backend, "Special" }
-    len = 12 + sw(backend)
-    ret[#ret + 1] = { string.rep(" ", 40 - len) }
+    len = 12 + sw(backend) + metadata_width
+    ret[#ret + 1] = { string.rep(" ", math.max(0, 40 - len)) }
     if picker then
       local item = setmetatable({}, state) --[[@as snacks.picker.Item]]
       item.file = state.session.cwd

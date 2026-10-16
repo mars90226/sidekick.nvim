@@ -92,7 +92,15 @@ end
 
 ---@return sidekick.cli.session.State[]
 function M.sessions()
-  return vim.tbl_values(M.terminals)
+  local ret = {}
+  for _, terminal in ipairs(vim.tbl_values(M.terminals)) do
+    if terminal.manual_input and terminal.started and not terminal:is_running() then
+      terminal:close()
+    else
+      ret[#ret + 1] = terminal
+    end
+  end
+  return ret
 end
 
 ---@param opts sidekick.cli.session.Opts
@@ -149,7 +157,10 @@ function M:start()
     return
   end
   if self.manual_input then
-    assert(not self.closed and not self.job, "Herdr attachment ended; select the agent again")
+    if self.closed or self.job then
+      self:close()
+      error("Herdr attachment ended; select the agent again")
+    end
     assert(self.parent:validate(), "Herdr target changed; select the agent again")
   end
 
@@ -194,6 +205,19 @@ function M:start()
     group = self.group,
     buffer = self.buf,
     callback = function()
+      if self.manual_input then
+        local status = vim.v.event.status
+        vim.schedule(function()
+          if self.closed then
+            return
+          end
+          if status ~= 0 then
+            Util.error("Herdr attach client exited with status " .. status .. "; select the existing agent again")
+          end
+          self:close()
+        end)
+        return
+      end
       local ms = (vim.uv.hrtime() - self.atime) / 1e6
       if ms < TERM_CLOSE_DELAY then
         -- don't close if the terminal closed too quickly

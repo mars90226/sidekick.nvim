@@ -1,4 +1,12 @@
 local Config = require("sidekick.config")
+local Util = require("sidekick.util")
+
+---@class sidekick.cli.muxer.Herdr: sidekick.cli.Session
+---@field endpoint {name:string, socket:string}
+---@field binding {terminal:string, pane:string, kind:string, native?:table}
+---@field process_identity {group:integer, starttime:string}
+---@field agent_name? string
+---@field agent_status? string
 
 -- Experimental, existing agents only. No server creation or input API fallback.
 local M = { priority = 50, external = false, manual_input = true }
@@ -12,20 +20,39 @@ function M.command(args, session)
   return vim.list_extend({ "herdr", "--session", session }, args)
 end
 
+local function fail(message)
+  M.last_error = "Herdr: " .. message
+  if M._warned ~= M.last_error then
+    M._warned = M.last_error
+    Util.warn(M.last_error)
+  end
+  return {}
+end
+
 function M.json(args, session)
   local cmd = session and M.command(args, session) or vim.list_extend({ "herdr" }, args)
   local ok, result = pcall(function()
     return vim.system(cmd, { text = true, timeout = 1500 }):wait()
   end)
   if not ok or result.code ~= 0 then
+    local detail = ok and (result.stderr or ""):match("[^\r\n]+") or tostring(result)
+    M._command_error = table.concat(args, " ") .. " failed" .. (detail and (": " .. detail) or "")
     return nil
   end
   local decoded, value = pcall(vim.json.decode, result.stdout or "")
-  return decoded and type(value) == "table" and not value.error and value or nil
+  if not decoded or type(value) ~= "table" then
+    M._command_error = table.concat(args, " ") .. " returned invalid JSON"
+    return nil
+  elseif value.error ~= nil and value.error ~= vim.NIL then
+    M._command_error = table.concat(args, " ") .. " returned an API error"
+    return nil
+  end
+  return value
 end
 
 function M.endpoint()
-  local name = Config.cli.mux.herdr.session
+  local opts = Config.cli.mux.herdr
+  local name = type(opts) == "table" and opts.session
   if not present(name) or not name:match("^[%w_-]+$") then
     return nil
   end
@@ -62,7 +89,7 @@ function M.server_matches(endpoint)
   if status then
     walk(status)
   end
-  return sockets[endpoint.socket] == true and vim.tbl_count(sockets) == 1
+  return status and status.running == true and sockets[endpoint.socket] == true and vim.tbl_count(sockets) == 1
 end
 
 function M.snapshot(endpoint)
@@ -117,9 +144,16 @@ function M.process_identity(endpoint, pane)
 end
 
 function M.sessions()
+  M._command_error = nil
   local endpoint = M.endpoint()
-  local snapshot = endpoint and M.snapshot(endpoint)
-  local ret, tools = {}, Config.tools()
+  if not endpoint then
+    return fail(M._command_error or "configure cli.mux.herdr.session as an existing running server name")
+  end
+  local snapshot = M.snapshot(endpoint)
+  if not snapshot then
+    return fail(M._command_error or "server socket, snapshot or client/server version did not match")
+  end
+  local ret, tools, unavailable = {}, Config.tools(), false
   for _, agent in ipairs(snapshot and snapshot.agents or {}) do
     if type(agent) == "table" and tools[agent.agent] and present(agent.terminal_id) and present(agent.pane_id) then
       local cwd = present(agent.foreground_cwd) and agent.foreground_cwd or agent.cwd
@@ -133,16 +167,34 @@ function M.sessions()
           binding = M.binding(agent),
           process_identity = process,
           agent_name = present(agent.name) and agent.name or nil,
-          agent_status = agent.agent_status,
+          agent_status = present(agent.agent_status) and agent.agent_status or nil,
           mux_session = endpoint.name,
         }
+      else
+        unavailable = true
       end
     end
   end
+  if #ret == 0 and unavailable then
+    return fail(
+      M._command_error or "matching agents lack a cwd or a live non-shell foreground process in this Linux namespace"
+    )
+  end
+  M.last_error, M._warned = nil, nil
   return ret
 end
 
+function M:same_owner(other)
+  return type(self.process_identity) == "table"
+    and vim.deep_equal(self.endpoint, other.endpoint)
+    and vim.deep_equal(self.binding, other.binding)
+    and vim.deep_equal(self.process_identity, other.process_identity)
+end
+
 function M:validate()
+  if type(self.binding) ~= "table" or type(self.endpoint) ~= "table" or type(self.process_identity) ~= "table" then
+    return false
+  end
   local endpoint = M.endpoint()
   if not endpoint or not vim.deep_equal(endpoint, self.endpoint) or not M.server_matches(endpoint) then
     return false
@@ -157,7 +209,12 @@ end
 
 function M:attach()
   assert(self:validate(), "Herdr target changed or server unavailable; select the agent again")
-  return { cmd = M.command({ "agent", "attach", self.binding.pane }, self.endpoint.name) }
+  local client = vim.fn.exepath("herdr")
+  assert(client ~= "", "Herdr client is unavailable")
+  return {
+    cmd = { client, "terminal", "attach", self.binding.terminal },
+    env = { HERDR_SOCKET_PATH = self.endpoint.socket, HERDR_SESSION = false },
+  }
 end
 
 function M:is_running()
@@ -165,7 +222,10 @@ function M:is_running()
 end
 
 function M:start()
-  error("Herdr PoC only attaches existing agents; select a running session")
+  error(
+    "Herdr PoC only attaches existing agents; select a running session"
+      .. (M.last_error and (": " .. M.last_error) or "")
+  )
 end
 
 function M:send()
