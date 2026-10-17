@@ -67,6 +67,15 @@ function M.prompt(opts)
   require("sidekick.cli.ui.prompt").select(opts)
 end
 
+--- Explicitly create a new agent using the primary backend, after confirmation.
+--- Herdr creates a dedicated workspace; other backends retain their usual start behavior.
+--- send/select never call this action. The returned herdr operation has id/phase/journal.
+---@param opts? {name?:string, cwd?:string, focus?:boolean, on_done?:fun(op:table)}
+---@return table? operation Nil while choosing a tool; on_done reports the first settled outcome.
+function M.new(opts)
+  return require("sidekick.cli.create").new(opts)
+end
+
 --- Start or attach to a CLI tool
 ---@param opts? sidekick.cli.Select|{cb:nil}|{focus?:boolean}
 ---@overload fun(cb:fun(state?:sidekick.cli.State))
