@@ -78,6 +78,9 @@ local function respond(cmd)
     if state.socket_after_create then
       state.socket = state.socket_after_create
     end
+    if state.workspace_reply then
+      return state.workspace_reply
+    end
     if state.workspace_error then
       return result("{bad", 124, "synthetic timeout")
     end
@@ -124,6 +127,9 @@ local function respond(cmd)
     return result("command submitted")
   elseif a[1] == "agent" and a[2] == "start" then
     state.started, state.name, state.kind = true, a[3], a[5]
+    if state.start_reply then
+      return state.start_reply
+    end
     if state.start_error then
       return result("", 124, "synthetic start timeout")
     end
@@ -203,11 +209,13 @@ getmetatable(T).opts.hooks = {
       cb(items[1])
     end
     Session.attach = function(source)
-      expect.equality(source.started, true)
-      expect.equality(source.backend, "herdr")
-      expect.equality(source.manual_input, true)
-      attached[#attached + 1] = source
-      return { show = function() end, focus = function() end }
+      return checked(function()
+        expect.equality(source.started, true)
+        expect.equality(source.backend, "herdr")
+        expect.equality(source.manual_input, true)
+        attached[#attached + 1] = source
+        return { show = function() end, focus = function() end }
+      end)
     end
     vim.system = function(argv, opts, cb)
       return checked(function()
@@ -651,7 +659,7 @@ T["failed initial journal settles without remote commands or a reservation"] = f
     end,
   })
   expect.equality(completed, 1)
-  expect.equality(op.phase, "unknown")
+  expect.equality(op.phase, "failed")
   expect.equality(Create.pending[op.key], nil)
   expect.equality(calls, {})
 end
@@ -898,6 +906,7 @@ T["workspace pre-dispatch journal failure releases an unsent reservation"] = fun
   end
   local op = wait(Create.new({ name = "codex" }))
   expect.equality(op.workspace_dispatched, false)
+  expect.equality(op.phase, "failed")
   expect.equality(count("workspace", "create"), 0)
   expect.equality(Create.pending[op.key], nil)
   local next_op = wait(Create.new({ name = "codex" }))
@@ -1003,7 +1012,7 @@ T["a partial journal write stops before remote commands"] = function()
     return original.write(fd, data:sub(1, -2), offset)
   end
   local op = Create.new({ name = "codex" })
-  expect.equality(op.phase, "unknown")
+  expect.equality(op.phase, "failed")
   expect.equality(op.persist_error:find("Short creation journal write", 1, true) ~= nil, true)
   expect.equality(calls, {})
 end
@@ -1302,6 +1311,51 @@ T["nullable foreground cwd falls back to the reported cwd consistently"] = funct
   expect.equality(op.phase, "attached")
   expect.equality(attached[1].cwd, root)
   expect.equality(count("agent", "start"), 1)
+end
+
+for _, case in ipairs({ "timeout", "api-message", "api-code", "signal" }) do
+  T["workspace failure keeps cause and no-retry warning: " .. case] = function()
+    state.workspace_reply = case == "timeout" and result("", 124, "")
+      or case == "api-message" and result({ error = { message = "busy" } })
+      or case == "api-code" and result({ error = { code = "busy" } })
+      or result("", 1, "")
+    if case == "signal" then
+      state.workspace_reply.signal = 15
+    end
+    local op = wait(Create.new({ name = "codex" }))
+    local cause = case == "timeout" and "timed out" or case == "signal" and "signal 15" or "busy"
+    expect.equality(op.phase, "unknown")
+    expect.equality(op.error:find(cause, 1, true) ~= nil, true)
+    expect.equality(op.error:find("do not retry creation", 1, true) ~= nil, true)
+    expect.equality(count("workspace", "create"), 1)
+    expect.equality(count("agent", "start"), 0)
+  end
+end
+
+for _, case in ipairs({ "missing", "not-ready", "blocked" }) do
+  T["start failure keeps its original cause after reconciliation: " .. case] = function()
+    state.start_reply = result("", 1, "unsupported flag --effort")
+    state.agent_missing = case == "missing"
+    state.ready = case ~= "not-ready"
+    state.status = case == "blocked" and "blocked" or "idle"
+    local op = wait(Create.new({ name = "codex" }))
+    expect.equality(op.phase, case == "blocked" and "blocked" or "unknown")
+    expect.equality(op.error:find("unsupported flag --effort", 1, true) ~= nil, true)
+    local saved = vim.json.decode(table.concat(vim.fn.readfile(op.journal), "\n"))
+    expect.equality(saved.start_error, "unsupported flag --effort")
+    expect.equality(count("agent", "start"), 1)
+  end
+end
+
+for _, case in ipairs({ "blank_reads", "shell_children" }) do
+  T["slow shell exhausts its passive wait with timeout reason: " .. case] = function()
+    state[case] = 25
+    local op = wait(Create.new({ name = "codex" }))
+    expect.equality(op.phase, "unknown")
+    expect.equality(op.error:find("Timed out waiting for shell", 1, true) ~= nil, true)
+    expect.equality(count("pane", "run"), 0)
+    expect.equality(count("agent", "start"), 0)
+  end
 end
 
 return T

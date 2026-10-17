@@ -591,7 +591,8 @@ require("sidekick.cli").hide(opts)
 </td></tr>
 <tr><td> Open a CLI using the primary backend, after confirmation.
 Herdr creates a dedicated workspace. tmux/zellij may reuse an existing mux
-session with the same tool/cwd name; matching registered sessions are refused.
+session with the same tool/cwd name. Sessions registered under this tool/cwd's
+Sidekick id are refused; discovered panes can have different ids.
 send/select never call this action. Returned operations have id/phase/journal.
 on_done runs once for a newly planned operation. Dismissed tool pickers,
 raised validation errors and deduplicated calls do not invoke a new callback.</td><td>

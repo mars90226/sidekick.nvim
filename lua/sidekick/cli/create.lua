@@ -113,6 +113,7 @@ local function save(op, preserve_outcome)
     "tab",
     "workspace_dispatched",
     "start_dispatched",
+    "start_error",
     "cancelled",
     "records",
   }) do
@@ -131,7 +132,8 @@ local function save(op, preserve_outcome)
   if not ok then
     op.persist_error = "Cannot save creation journal: " .. tostring(err)
     if not preserve_outcome then
-      op.phase, op.error = "unknown", op.error or op.persist_error
+      op.phase, op.error =
+        (op.workspace_dispatched or op.start_dispatched) and "unknown" or "failed", op.error or op.persist_error
     end
     Util.error(op.persist_error .. "; inspect operation " .. op.id)
   end
@@ -139,6 +141,9 @@ local function save(op, preserve_outcome)
 end
 
 local function finish(op, phase, reason)
+  if op.start_error and (phase == "unknown" or phase == "blocked") then
+    reason = (reason or "Agent startup is uncertain") .. "; agent start: " .. op.start_error
+  end
   op.phase, op.error = phase, reason and redact(op, reason) or nil
   save(op, true)
   if reason then
@@ -205,9 +210,19 @@ local function call(op, args, timeout, json, cb)
         return
       end
       if failure then
-        local detail = result.stderr and result.stderr ~= "" and result.stderr
-          or "CLI failed or returned an invalid reply"
-        cb(nil, detail, result)
+        local api_error = json and value and type(value.error) == "table" and value.error or nil
+        local detail
+        if result.code == 124 then
+          detail = "CLI timed out"
+        elseif result.signal and result.signal ~= 0 then
+          detail = "CLI interrupted by signal " .. tostring(result.signal)
+        elseif api_error then
+          detail = type(api_error.message) == "string" and api_error.message
+            or ("herdr API error: " .. tostring(api_error.code or "unknown"))
+        else
+          detail = result.stderr and result.stderr:match("[^\r\n]+")
+        end
+        cb(nil, detail or "CLI failed or returned an invalid reply", result)
       else
         cb(value, nil, result)
       end
@@ -309,6 +324,14 @@ local function check_shell(op, cb)
             return vim.defer_fn(read_process, 100)
           end
         end
+        if
+          shell_attempts >= 20
+          and type(info) == "table"
+          and type(info.foreground_processes) == "table"
+          and #info.foreground_processes > 1
+        then
+          return finish(op, "unknown", "Timed out waiting for shell startup to settle; no agent started")
+        end
         if not process or not shell_matches(op, info) then
           return finish(op, "unknown", why or "Created pane is not at its expected plain shell")
         end
@@ -323,6 +346,9 @@ local function check_shell(op, cb)
             -- Only an empty screen gets bounded passive waiting; drafts are never cleared.
             if visible and visible:match("^%s*$") and attempts < 20 then
               return vim.defer_fn(read_prompt, 100)
+            end
+            if visible and visible:match("^%s*$") and attempts >= 20 then
+              return finish(op, "unknown", "Timed out waiting for shell prompt; no agent started")
             end
             if not visible or not empty_prompt(visible) then
               return finish(op, "unknown", failure or "Shell prompt is unrecognized or has input; no agent started")
@@ -425,7 +451,8 @@ local function start_agent(op)
       local args =
         { "agent", "start", op.name, "--kind", op.tool, "--pane", op.pane, "--timeout", tostring(op.timeout), "--" }
       vim.list_extend(args, op.args)
-      call(op, args, op.timeout + 15000, true, function(value)
+      call(op, args, op.timeout + 15000, true, function(value, err)
+        op.start_error = err and redact(op, err) or nil
         local agent = value and value.result and value.result.agent
         if type(agent) == "table" then
           if agent.name ~= op.name or agent.agent ~= op.tool or not pane_matches(op, agent) then
@@ -491,6 +518,7 @@ local function begin(op)
     op.phase, op.workspace_dispatched = "creating_workspace", true
     if not save(op) then
       op.workspace_dispatched = false -- No command was invoked; release this reservation.
+      op.phase = "failed"
       return complete(op)
     end
     local args =
@@ -500,7 +528,11 @@ local function begin(op)
     end
     call(op, args, 10000, true, function(value, err)
       if not capture_workspace(op, value) then
-        return finish(op, "unknown", err or "Workspace response is incomplete; do not retry creation")
+        return finish(
+          op,
+          "unknown",
+          (err or "Workspace response is incomplete") .. "; workspace may exist; do not retry creation"
+        )
       end
       op.phase = "workspace_created"
       if not save(op) then
