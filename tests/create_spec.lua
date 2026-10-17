@@ -166,6 +166,9 @@ getmetatable(T).opts.hooks = {
       tools = Config.cli.tools,
       system = vim.system,
       write = vim.uv.fs_write,
+      close = vim.uv.fs_close,
+      open = vim.uv.fs_open,
+      encode = vim.json.encode,
       terminals = Terminal.terminals,
       rename = vim.uv.fs_rename,
       exepath = vim.fn.exepath,
@@ -253,6 +256,7 @@ getmetatable(T).opts.hooks = {
     end)
     vim.system, vim.ui.select, Session.attach = original.system, original.select, original.attach
     vim.uv.fs_rename, vim.uv.fs_write = original.rename, original.write
+    vim.uv.fs_close, vim.uv.fs_open, vim.json.encode = original.close, original.open, original.encode
     for _, terminal in pairs(Terminal.terminals) do
       if terminal.group then
         pcall(vim.api.nvim_del_augroup_by_id, terminal.group)
@@ -684,6 +688,10 @@ T["journal failure after workspace reply preserves IDs and settles once without 
   expect.equality(op.workspace, "w-mvp")
   expect.equality(op.terminal, "term-mvp")
   expect.equality(#op.records, 2)
+  local notice = table.concat(notices, "\n")
+  for _, value in ipairs({ op.workspace, op.pane, "unknown", "journal unavailable", "not retried" }) do
+    expect.equality(notice:find(value, 1, true) ~= nil, true)
+  end
   expect.equality(Create.pending[op.key], op)
   expect.equality(count("agent", "start"), 0)
   expect.equality(#attached, 0)
@@ -1356,6 +1364,140 @@ for _, case in ipairs({ "blank_reads", "shell_children" }) do
     expect.equality(count("pane", "run"), 0)
     expect.equality(count("agent", "start"), 0)
   end
+end
+
+T["journal failure on start reply exposes preserved resources without verify or attach"] = function()
+  vim.uv.fs_rename = function(from, to)
+    local data = vim.json.decode(table.concat(vim.fn.readfile(from), "\n"))
+    if data.records[#data.records] and data.records[#data.records].command == "agent start" then
+      return nil, "ENOSPC"
+    end
+    return original.rename(from, to)
+  end
+  local done = 0
+  local op = wait(Create.new({
+    name = "codex",
+    on_done = function()
+      done = done + 1
+    end,
+  }))
+  expect.equality(op.phase, "unknown")
+  expect.equality(done, 1)
+  expect.equality(count("agent", "start"), 1)
+  expect.equality(count("agent", "get"), 0)
+  expect.equality(#attached, 0)
+  expect.equality(Create.pending[op.key], op)
+  local notice = table.concat(notices, "\n")
+  for _, value in ipairs({ op.workspace, op.pane, "unknown", "journal unavailable", "not retried" }) do
+    expect.equality(notice:find(value, 1, true) ~= nil, true)
+  end
+end
+
+for _, mismatch in ipairs({ false, true }) do
+  T["late initial server reply preserves cancellation: mismatch=" .. tostring(mismatch)] = function()
+    state.hold = "status server"
+    local done = 0
+    local op = Create.new({
+      name = "codex",
+      on_done = function()
+        done = done + 1
+      end,
+    })
+    expect.equality(
+      vim.wait(2000, function()
+        return #held == 1
+      end),
+      true
+    )
+    Create.cancel(op.id)
+    local reason, notice_count = op.error, #notices
+    if mismatch then
+      for i = 1, 20 do
+        local name, reply = debug.getupvalue(held[1], i)
+        if name == "reply" then
+          local value = vim.json.decode(reply.stdout)
+          value.socket = "/tmp/other.sock"
+          reply.stdout = vim.json.encode(value)
+          break
+        end
+      end
+    end
+    held[1]()
+    expect.equality(
+      vim.wait(2000, function()
+        return #op.records == 1
+      end),
+      true
+    )
+    expect.equality(op.phase, "cancelled")
+    expect.equality(op.error, reason)
+    expect.equality(#notices, notice_count)
+    expect.equality(done, 1)
+    expect.equality(count("workspace", "create"), 0)
+    local saved = vim.json.decode(table.concat(vim.fn.readfile(op.journal), "\n"))
+    expect.equality(saved.phase, "cancelled")
+    expect.equality(saved.error, reason)
+  end
+end
+
+T["failed fs_close prevents workspace dispatch and releases reservation"] = function()
+  vim.uv.fs_close = function(fd)
+    local path = vim.uv.fs_readlink("/proc/self/fd/" .. fd) or ""
+    local closed, why = original.close(fd)
+    if path:find(".json.tmp", 1, true) then
+      -- Fail only the write-ahead save after initial planning.
+      local data = vim.json.decode(table.concat(vim.fn.readfile(path), "\n"))
+      if data.phase == "creating_workspace" then
+        return nil, "EIO"
+      end
+    end
+    return closed, why
+  end
+  local done = 0
+  local op = wait(Create.new({
+    name = "codex",
+    on_done = function()
+      done = done + 1
+    end,
+  }))
+  expect.equality(op.phase, "failed")
+  expect.equality(op.persist_error:find("EIO", 1, true) ~= nil, true)
+  expect.equality(count("workspace", "create"), 0)
+  expect.equality(Create.pending[op.key], nil)
+  expect.equality(done, 1)
+end
+
+T["journal encoding failure opens no descriptor and sends nothing"] = function()
+  local opened = 0
+  vim.uv.fs_open = function(...)
+    opened = opened + 1
+    return original.open(...)
+  end
+  vim.json.encode = function(value, ...)
+    if value.phase then
+      error("synthetic encode failure")
+    end
+    return original.encode(value, ...)
+  end
+  local op = Create.new({ name = "codex" })
+  expect.equality(op.phase, "failed")
+  expect.equality(opened, 0)
+  expect.equality(calls, {})
+end
+
+T["journal write exception still closes its descriptor"] = function()
+  local closed = 0
+  vim.uv.fs_write = function()
+    error("synthetic write failure")
+  end
+  vim.uv.fs_close = function(fd)
+    closed = closed + 1
+    return original.close(fd)
+  end
+  local op = Create.new({ name = "codex" })
+  expect.equality(op.phase, "failed")
+  expect.equality(closed, 1)
+  expect.equality(calls, {})
 end
 
 return T

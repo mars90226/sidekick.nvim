@@ -120,18 +120,20 @@ local function save(op, preserve_outcome)
     data[key] = op[key]
   end
   local ok, err = pcall(function()
+    local encoded = vim.json.encode(data) .. "\n"
     local dir = vim.fs.dirname(op.journal)
     vim.fn.mkdir(dir, "p", 448)
     local fd = assert(vim.uv.fs_open(op.journal .. ".tmp", "w", 384))
-    local encoded = vim.json.encode(data) .. "\n"
-    local written, why = vim.uv.fs_write(fd, encoded, 0)
-    vim.uv.fs_close(fd)
+    local wrote, written, why = pcall(vim.uv.fs_write, fd, encoded, 0)
+    local closed, close_error = vim.uv.fs_close(fd)
+    assert(wrote, written)
     assert(written == #encoded, why or "Short creation journal write")
+    assert(closed, close_error)
     assert(vim.uv.fs_rename(op.journal .. ".tmp", op.journal))
   end)
   if not ok then
     op.persist_error = "Cannot save creation journal: " .. tostring(err)
-    if not preserve_outcome then
+    if not preserve_outcome and op.phase ~= "cancelled" then
       op.phase, op.error =
         (op.workspace_dispatched or op.start_dispatched) and "unknown" or "failed", op.error or op.persist_error
     end
@@ -160,6 +162,25 @@ local function finish(op, phase, reason)
         .. op.journal
     )
   end
+  complete(op)
+end
+
+-- A failed journal cannot be retried safely after a remote mutation. Keep the
+-- live ownership evidence visible even when it could not be written to disk.
+local function stop_persistence(op)
+  Util.warn(
+    "New "
+      .. op.tool
+      .. ": "
+      .. op.phase
+      .. "; journal unavailable; resources, if any, are preserved; not retried"
+      .. (op.workspace and ("; workspace " .. op.workspace) or "")
+      .. (op.pane and ("; pane " .. op.pane) or "")
+      .. "; operation "
+      .. op.id
+      .. ", journal "
+      .. op.journal
+  )
   complete(op)
 end
 
@@ -206,7 +227,7 @@ local function call(op, args, timeout, json, cb)
         if not failure and args[1] == "workspace" and args[2] == "create" then
           capture_workspace(op, value)
         end
-        complete(op) -- No further mutation/attachment when the journal is unavailable.
+        stop_persistence(op) -- No further mutation/attachment when the journal is unavailable.
         return
       end
       if failure then
@@ -235,6 +256,9 @@ end
 
 local function server(op, cb, observe)
   call(op, { "status", "server", "--json" }, 2000, true, function(value, err)
+    if op.cancelled and op.phase == "cancelled" and not observe then
+      return -- The late reply is recorded, but cannot overwrite a settled cancellation.
+    end
     if
       not value
       or value.running ~= true
@@ -397,7 +421,7 @@ local function verify(op, attach)
       reason = reason and redact(op, reason) or nil,
     }
     if not save(op) then
-      return complete(op)
+      return stop_persistence(op)
     end
     if not process then
       return finish(op, "unknown", foreground == "shell" and "Agent exited; pane is back at its shell" or reason)
@@ -446,7 +470,7 @@ local function start_agent(op)
       op.phase, op.start_dispatched = "launching", true
       if not save(op) then
         op.start_dispatched = false -- The start command has not been invoked.
-        return complete(op)
+        return stop_persistence(op)
       end
       local args =
         { "agent", "start", op.name, "--kind", op.tool, "--pane", op.pane, "--timeout", tostring(op.timeout), "--" }
@@ -536,7 +560,7 @@ local function begin(op)
       end
       op.phase = "workspace_created"
       if not save(op) then
-        return complete(op)
+        return stop_persistence(op)
       end
       if op.cancelled then
         return finish(op, "cancelled", "Created workspace is preserved; no agent started")
