@@ -157,6 +157,9 @@ function M:wo(opts)
 end
 
 function M:start()
+  if self.closed and not self.manual_input then
+    error("Terminal is closed; create or select the tool again")
+  end
   if self:is_running() then
     return
   end

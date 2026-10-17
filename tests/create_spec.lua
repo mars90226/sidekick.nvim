@@ -176,6 +176,11 @@ getmetatable(T).opts.hooks = {
       rename = vim.uv.fs_rename,
       exepath = vim.fn.exepath,
       executable = vim.fn.executable,
+      jobstart = vim.fn.jobstart,
+      jobwait = vim.fn.jobwait,
+      jobpid = vim.fn.jobpid,
+      jobstop = vim.fn.jobstop,
+      watch = Config.cli.watch,
       select = vim.ui.select,
       attach = Session.attach,
       backends = Session.backends,
@@ -205,6 +210,12 @@ getmetatable(T).opts.hooks = {
         return root .. "/fixture-bin/" .. name
       end
       return original.exepath(name)
+    end
+    vim.fn.executable = function(name)
+      if name == "codex" or name == "claude" then
+        return 1
+      end
+      return original.executable(name)
     end
     Util.warn, Util.error =
       function(s)
@@ -268,6 +279,9 @@ getmetatable(T).opts.hooks = {
     end
     Terminal.terminals = original.terminals
     vim.fn.exepath, vim.fn.executable = original.exepath, original.executable
+    vim.fn.jobstart, vim.fn.jobwait, vim.fn.jobpid, vim.fn.jobstop =
+      original.jobstart, original.jobwait, original.jobpid, original.jobstop
+    Config.cli.watch = original.watch
     Config.cli.primary_backend, Config.cli.discovery, Config.cli.mux, Config.cli.tools =
       original.primary, original.discovery, original.mux, original.tools
     Session.backends, Session.did_setup, Session._attached = original.backends, original.setup, original.attached
@@ -1543,6 +1557,105 @@ for _, backend in ipairs({ "tmux", "zellij" }) do
     expect.equality(selected, 0)
     expect.equality(opened, 0)
     expect.equality(calls, {})
+  end
+end
+
+T["non-herdr missing tool is refused before confirmation or journal"] = function()
+  Config.cli.primary_backend = "terminal"
+  Session.register("terminal", Terminal)
+  vim.fn.executable = function()
+    return 0
+  end
+  local selected, opened = 0, 0
+  vim.ui.select = function()
+    selected = selected + 1
+  end
+  vim.uv.fs_open = function(...)
+    opened = opened + 1
+    return original.open(...)
+  end
+  local ok, err = pcall(Create.new, { name = "codex" })
+  expect.equality(ok, false)
+  expect.equality(tostring(err):find("not installed", 1, true) ~= nil, true)
+  expect.equality(selected, 0)
+  expect.equality(opened, 0)
+  expect.equality(Session._attached, {})
+end
+
+for _, failure in ipairs({ "zero", "negative", "throw" }) do
+  T["real terminal lifecycle cleans failed spawn and permits retry: " .. failure] = function()
+    Config.cli.primary_backend, Config.cli.watch = "terminal", false
+    Session.register("terminal", Terminal)
+    Session.attach = original.attach
+    local live, succeed, attempts, stopped = false, false, 0, 0
+    vim.fn.jobstart = function()
+      attempts = attempts + 1
+      if succeed then
+        live = true
+        return 87654321
+      end
+      if failure == "throw" then
+        error("synthetic jobstart failure")
+      end
+      return failure == "zero" and 0 or -1
+    end
+    vim.fn.jobwait = function()
+      return { live and -1 or -3 }
+    end
+    vim.fn.jobpid = function()
+      return vim.fn.getpid()
+    end
+    vim.fn.jobstop = function()
+      live = false
+      stopped = stopped + 1
+      return 1
+    end
+    local buffers, windows = #vim.api.nvim_list_bufs(), #vim.api.nvim_list_wins()
+    local done = 0
+    local op = Create.new({
+      name = "codex",
+      focus = false,
+      on_done = function()
+        done = done + 1
+      end,
+    })
+    expect.equality(op.phase, "failed")
+    expect.equality(done, 1)
+    expect.equality(attempts, 1) -- No implicit second start through show().
+    expect.equality(
+      op.error:find(failure == "throw" and "synthetic jobstart failure" or "Failed to start", 1, true) ~= nil,
+      true
+    )
+    expect.equality(#vim.api.nvim_list_bufs(), buffers)
+    expect.equality(#vim.api.nvim_list_wins(), windows)
+    expect.equality(Terminal.terminals, {})
+    expect.equality(Session._attached, {})
+    expect.equality(Create.pending[op.key], nil)
+    succeed = true
+    local next_op = Create.new({ name = "codex", focus = false })
+    expect.equality(next_op.phase, "attached")
+    expect.equality(attempts, 2)
+    expect.equality(next_op.session:is_running(), true)
+    next_op.session:close()
+    expect.error(function()
+      next_op.session:show()
+    end)
+    expect.equality(attempts, 2) -- A closed handle cannot restart or rebuild its UI.
+    expect.equality(stopped, 1)
+    expect.equality(Terminal.terminals, {})
+    expect.equality(Session._attached, {})
+    expect.equality(#vim.api.nvim_list_bufs(), buffers)
+    expect.equality(#vim.api.nvim_list_wins(), windows)
+  end
+end
+
+for _, doubled in ipairs({ false, true }) do
+  T["arrow shell prompt boundary: doubled=" .. tostring(doubled)] = function()
+    local arrow = "\226\157\175"
+    state.draft = (doubled and arrow .. arrow or arrow) .. " "
+    local op = wait(Create.new({ name = "codex" }))
+    expect.equality(op.phase, doubled and "unknown" or "attached")
+    expect.equality(count("agent", "start"), doubled and 0 or 1)
   end
 end
 

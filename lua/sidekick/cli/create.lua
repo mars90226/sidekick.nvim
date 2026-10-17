@@ -304,12 +304,14 @@ local function shell_matches(op, info)
     and same_cwd(proc.cwd, op.real_cwd)
 end
 
+local arrow_prompt = "\226\157\175"
+
 local function empty_prompt(visible)
   local line = (visible or ""):match("([^\r\n]+)[\r\n%s]*$") or ""
   -- One prompt marker, no trailing input. A second marker can be shell draft
   -- syntax (comments/redirection); `>` may be a continuation prompt, so reject it.
-  local prefix = line:match("^(.-)[$#%%] ?$") or line:match("^(.-)❯ ?$")
-  return prefix ~= nil and not prefix:find("[$#%%>]") and not prefix:find("❯", 1, true)
+  local prefix = line:match("^(.-)[$#%%] ?$") or line:match("^(.-)" .. arrow_prompt .. " ?$")
+  return prefix ~= nil and not prefix:find("[$#%%>]") and not prefix:find(arrow_prompt, 1, true)
 end
 
 local function check_shell(op, cb)
@@ -639,6 +641,9 @@ local function plan(opts)
     )
     return previous, true
   end
+  if backend ~= "herdr" then
+    assert(vim.fn.executable(tool.cmd[1]) == 1, "Tool '" .. opts.name .. "' is not installed")
+  end
   local executable = backend == "herdr" and vim.fn.exepath(opts.name) or nil
   assert(backend ~= "herdr" or text(executable), "Canonical agent executable is unavailable locally")
   table.sort(secrets, function(a, b)
@@ -710,9 +715,11 @@ function M.new(opts)
     if op.backend == "herdr" then
       begin(op)
     else
+      local Terminal = require("sidekick.cli.terminal")
+      local terminals_before = vim.tbl_extend("force", {}, Terminal.terminals)
+      local sid = Session.sid({ tool = op.tool, cwd = op.cwd })
+      local source, session
       local ok, err = pcall(function()
-        local sid = Session.sid({ tool = op.tool, cwd = op.cwd })
-        local Terminal = require("sidekick.cli.terminal")
         assert(
           not (
               Session._attached[sid]
@@ -722,7 +729,12 @@ function M.new(opts)
             ),
           "A session is already registered for this tool/cwd; select it explicitly"
         )
-        local session = Session.attach(Session.new({ tool = op.tool, cwd = op.cwd, backend = op.backend }))
+        source = Session.new({ tool = op.tool, cwd = op.cwd, backend = op.backend })
+        session = Session.attach(source)
+        assert(
+          not session.closed and (session.backend ~= "terminal" or session:is_running()),
+          "Failed to start local CLI tool '" .. op.tool .. "'"
+        )
         if session.show then
           session:show()
         end
@@ -731,6 +743,27 @@ function M.new(opts)
         end
         op.session = session
       end)
+      if not ok then
+        -- Only clean terminals created by this synchronous request. An attach
+        -- exception can happen before Session.attach returns the wrapper.
+        for _, id in ipairs({
+          sid,
+          "terminal: " .. sid,
+          source and source.id or sid,
+          "terminal: " .. (source and source.id or sid),
+        }) do
+          local terminal = Terminal.get(id)
+          if terminal and terminals_before[id] ~= terminal then
+            local cleaned, cleanup_error = pcall(terminal.close, terminal)
+            if not cleaned then
+              err = tostring(err) .. "; terminal cleanup failed: " .. tostring(cleanup_error)
+            end
+          end
+        end
+        if session and Session._attached[session.id] == session then
+          Session.detach(session)
+        end
+      end
       finish(op, ok and "attached" or "failed", not ok and tostring(err) or nil)
     end
   end)
