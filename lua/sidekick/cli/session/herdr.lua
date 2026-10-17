@@ -35,8 +35,15 @@ function M.json(args, session)
     return vim.system(cmd, { text = true, timeout = 1500 }):wait()
   end)
   if not ok or result.code ~= 0 then
-    local detail = ok and (result.stderr or ""):match("[^\r\n]+") or tostring(result)
-    M._command_error = table.concat(args, " ") .. " failed" .. (detail and (": " .. detail) or "")
+    local detail
+    if ok then
+      detail = (result.stderr or ""):match("[^\r\n]+")
+        or (result.stdout or ""):match("[^\r\n]+")
+        or (result.code == 124 and "timed out after 1500ms" or ("exit " .. tostring(result.code)))
+    else
+      detail = tostring(result)
+    end
+    M._command_error = table.concat(args, " ") .. " failed: " .. detail
     return nil
   end
   local decoded, value = pcall(vim.json.decode, result.stdout or "")
@@ -44,7 +51,10 @@ function M.json(args, session)
     M._command_error = table.concat(args, " ") .. " returned invalid JSON"
     return nil
   elseif value.error ~= nil and value.error ~= vim.NIL then
-    M._command_error = table.concat(args, " ") .. " returned an API error"
+    local detail = type(value.error) == "table" and (value.error.message or value.error.code) or nil
+    M._command_error = table.concat(args, " ")
+      .. " returned an API error"
+      .. (present(detail) and (": " .. detail) or "")
     return nil
   end
   return value
@@ -89,7 +99,11 @@ function M.server_matches(endpoint)
   if status then
     walk(status)
   end
-  return status and status.running == true and sockets[endpoint.socket] == true and vim.tbl_count(sockets) == 1
+  local matches = status and status.running == true and sockets[endpoint.socket] == true and vim.tbl_count(sockets) == 1
+  if not matches and not M._command_error then
+    M._command_error = "server is not running or its socket identity did not match"
+  end
+  return matches
 end
 
 function M.snapshot(endpoint)
@@ -99,13 +113,23 @@ function M.snapshot(endpoint)
   local reply = M.json({ "api", "snapshot" }, endpoint.name)
   local snapshot = reply and type(reply.result) == "table" and reply.result.snapshot
   if type(snapshot) ~= "table" or type(snapshot.agents) ~= "table" then
+    M._command_error = M._command_error or "server returned an invalid snapshot"
+    return nil
+  end
+  if not present(snapshot.version) then
+    M._command_error = "server snapshot is missing its version"
     return nil
   end
   local ok, result = pcall(function()
     return vim.system({ "herdr", "--version" }, { text = true, timeout = 1500 }):wait()
   end)
   -- Direct attach uses the binary protocol, unlike JSON API discovery.
-  if not ok or result.code ~= 0 or (result.stdout or ""):match("herdr%s+(%S+)") ~= snapshot.version then
+  local client_version = ok and result.code == 0 and (result.stdout or ""):match("herdr%s+(%S+)") or nil
+  if not present(client_version) then
+    M._command_error = "herdr --version failed or returned no recognizable version"
+    return nil
+  elseif client_version ~= snapshot.version then
+    M._command_error = "client version " .. client_version .. " differs from server version " .. snapshot.version
     return nil
   end
   return snapshot
@@ -184,10 +208,12 @@ function M.sessions()
       end
     end
   end
-  if #ret == 0 and unavailable then
-    return fail(
-      M._command_error or "matching agents lack a cwd or a live non-shell foreground process in this Linux namespace"
+  if unavailable then
+    fail(
+      M._command_error
+        or "some matching agents lack a cwd or a live non-shell foreground process in this Linux namespace"
     )
+    return ret
   end
   M.last_error, M._warned = nil, nil
   return ret
@@ -201,23 +227,34 @@ function M:same_owner(other)
 end
 
 function M:validate()
+  M._command_error = nil
   if type(self.binding) ~= "table" or type(self.endpoint) ~= "table" or type(self.process_identity) ~= "table" then
-    return false
+    return false, "attachment has no complete ownership identity"
   end
   local endpoint = M.endpoint()
-  if not endpoint or not vim.deep_equal(endpoint, self.endpoint) or not M.server_matches(endpoint) then
-    return false
+  if not endpoint then
+    return false, M._command_error or "configured server is unavailable"
+  elseif not vim.deep_equal(endpoint, self.endpoint) then
+    return false, "configured server endpoint changed"
+  elseif not M.server_matches(endpoint) then
+    return false, M._command_error
   end
   local reply = M.json({ "agent", "get", self.binding.pane }, endpoint.name)
   local agent = reply and type(reply.result) == "table" and reply.result.agent
-  return type(agent) == "table"
-    and vim.deep_equal(M.binding(agent), self.binding)
-    and type(self.process_identity) == "table"
-    and vim.deep_equal(M.process_identity(endpoint, self.binding.pane), self.process_identity)
+  if type(agent) ~= "table" then
+    return false, M._command_error or "agent is no longer available"
+  elseif not vim.deep_equal(M.binding(agent), self.binding) then
+    return false, "agent binding changed"
+  end
+  if not vim.deep_equal(M.process_identity(endpoint, self.binding.pane), self.process_identity) then
+    return false, M._command_error or "foreground process identity changed or became unavailable"
+  end
+  return true
 end
 
 function M:attach()
-  assert(self:validate(), "Herdr target changed or server unavailable; select the agent again")
+  local valid, reason = self:validate()
+  assert(valid, "Herdr target unavailable: " .. tostring(reason) .. "; select the agent again")
   local client = vim.fn.exepath("herdr")
   assert(client ~= "", "Herdr client is unavailable")
   return {

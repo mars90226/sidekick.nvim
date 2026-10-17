@@ -87,6 +87,8 @@ local defaults = {
       -- Experimental herdr attachment: set backend = "herdr" and choose an existing
       -- running server below. Only existing agents are selectable; enabled does
       -- not permit creating agents or falling back to a new local tool.
+      -- Selecting herdr activates discovery regardless of mux.enabled; only existing
+      -- herdr agents are attachable, while other backends' existing sessions remain visible.
       -- Requires local Linux with the same /proc namespace, herdr on PATH, and
       -- identical client/server versions. Agent kinds must match configured tool names.
       -- Conflicting clients fail without takeover/retry. Closing a client preserves
@@ -95,7 +97,8 @@ local defaults = {
       -- Ownership is checked before attach/show and terminal ID + socket are pinned.
       -- These checks are not atomic: replacement after a check or while the window
       -- is already visible may receive manual input. No strict occupant binding is claimed.
-      -- Discovery currently uses bounded synchronous CLI calls and may block the UI.
+      -- Discovery and attach/show/focus ownership checks use bounded synchronous
+      -- CLI calls (up to 1.5s each), may repeat per action, and can block the UI.
       ---@class sidekick.cli.Herdr
       herdr = {
         -- Existing running herdr server name, matching letters/digits/_/-.

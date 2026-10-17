@@ -12,6 +12,14 @@ T["isolated herdr mock regression suite"] = function()
       env = { SIDEKICK_MINI_TEST = mini },
     })
     :wait()
-  MiniTest.expect.equality(result.code, 0, (result.stdout or "") .. (result.stderr or ""))
+  if result.code ~= 0 then
+    error(
+      "Herdr mock runner failed (exit "
+        .. tostring(result.code)
+        .. "):\n"
+        .. (result.stdout or "")
+        .. (result.stderr or "")
+    )
+  end
 end
 return T

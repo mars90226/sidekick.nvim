@@ -36,14 +36,15 @@ if scoped:
         forbidden("wrong server")
     args = args[2:]
 if args == ["--version"] and not scoped:
-    print("herdr 0.9.5")
+    print(state.get("client_version_output", "herdr 0.9.5"))
 elif args == ["session", "list", "--json"] and not scoped:
     reply({"sessions": state["sessions"]})
 elif args == ["status", "server", "--json"] and scoped:
     reply({"socket": state["socket"], "running": state.get("server_running", True)})
 elif args == ["api", "snapshot"] and scoped:
     if state.get("fail_snapshot"):
-        print("synthetic snapshot access denied", file=sys.stderr)
+        if not state.get("empty_error"):
+            print("synthetic snapshot access denied", file=sys.stderr)
         sys.exit(3)
     if state.get("malformed_snapshot"):
         print("{not-json")

@@ -50,6 +50,7 @@ getmetatable(T).opts.hooks = {
       error = Util.error,
       ui_select = vim.ui.select,
       executable = vim.fn.executable,
+      system = vim.system,
       last_error = H.last_error,
       warned = H._warned,
       command_error = H._command_error,
@@ -110,6 +111,7 @@ getmetatable(T).opts.hooks = {
     Terminal.terminals = original.terminals
     Util.warn, Util.error, vim.ui.select, vim.fn.executable =
       original.warn, original.error, original.ui_select, original.executable
+    vim.system = original.system
     H.last_error, H._warned, H._command_error = original.last_error, original.warned, original.command_error
     expect.equality(vim.fn.filereadable(root .. "/violations"), 0)
     local history = calls()
@@ -334,6 +336,7 @@ T["plugin owner conflict closes dead wrapper and permits explicit retry"] = func
   end, calls())
   expect.equality(#attempts, 1)
   expect.equality(#errors, 1)
+  expect.equality(errors[1]:find("mock input ownership conflict", 1, true) ~= nil, true)
   local source = vim.tbl_filter(function(item)
     return item.session.id == sessions[1].id
   end, require("sidekick.cli.state").get({ started = true }))
@@ -445,6 +448,12 @@ T["metadata refresh preserves original ownership"] = function()
   Session.sessions()
   expect.equality(t.parent.binding, binding)
   expect.equality(t.parent:validate(), false)
+  expect.equality(t.closed, true)
+  expect.equality(Terminal.get(t.id), nil)
+  local found = require("sidekick.cli.state").get({ started = true })
+  expect.equality(#vim.tbl_filter(function(item)
+    return item.session.id == t.source_id
+  end, found), 1)
 end
 
 T["public send with submit leaves no bytes or queued input"] = function()
@@ -587,6 +596,72 @@ T["attachment does not need the reported agent cwd to exist"] = function()
   t:close()
   expect.equality(Terminal.get(t.id), nil)
   expect.equality(#vim.api.nvim_list_wins(), before)
+end
+
+for _, server in ipairs({ vim.NIL, "", 123, "0.9.5" }) do
+  for _, client in ipairs({ "", "unexpected version", "herdr 0.9.5", "herdr 0.9.4" }) do
+    T["version gate server=" .. vim.inspect(server) .. " client=" .. client] = function()
+      state.snapshot.version = server
+      state.client_version_output = client
+      save(state)
+      local valid = server == "0.9.5" and client == "herdr 0.9.5"
+      expect.equality(#H.sessions(), valid and 2 or 0)
+      expect.equality(#warnings, valid and 0 or 1)
+    end
+  end
+end
+
+T["empty stderr has stable actionable exit diagnostic"] = function()
+  state.fail_snapshot, state.empty_error = true, true
+  save(state)
+  expect.equality(H.sessions(), {})
+  expect.equality(H.sessions(), {})
+  expect.equality(#warnings, 1)
+  expect.equality(warnings[1]:find("exit 3", 1, true) ~= nil, true)
+  expect.equality(warnings[1]:find("table:", 1, true), nil)
+end
+
+T["missing executable registers diagnosis instead of local fallback"] = function()
+  Config.cli.mux.backend = "herdr"
+  Session.backends, Session.did_setup = {}, false
+  vim.fn.executable = function()
+    return 0
+  end
+  vim.system = function()
+    error("herdr executable not found")
+  end
+  expect.equality(require("sidekick.cli.state").get(), {})
+  expect.equality(Session.backends.herdr ~= nil, true)
+  expect.equality(#warnings, 1)
+  expect.equality(warnings[1]:find("executable not found", 1, true) ~= nil, true)
+end
+
+T["validation preserves binding and process refusal reasons"] = function()
+  local source = Session.new(vim.tbl_extend("force", sessions[1], { backend = "herdr", started = true }))
+  state.snapshot.agents[1].agent_session.value = "replacement"
+  save(state)
+  local valid, reason = source:validate()
+  expect.equality(valid, false)
+  expect.equality(reason, "agent binding changed")
+  state.snapshot.agents[1].agent_session.value = "native-1"
+  state.processes = { ["w1:p1"] = { group = 2147483647 } }
+  save(state)
+  valid, reason = source:validate()
+  expect.equality(valid, false)
+  expect.equality(reason:find("foreground process identity", 1, true) ~= nil, true)
+end
+
+T["second validation failure unregisters never-started wrapper"] = function()
+  local source = Session.new(vim.tbl_extend("force", sessions[1], { backend = "herdr", started = true }))
+  local count = 0
+  source.validate = function()
+    count = count + 1
+    return count == 1, "synthetic second validation failure"
+  end
+  expect.error(function()
+    Session.attach(source)
+  end)
+  expect.equality(Terminal.terminals, {})
 end
 
 return T

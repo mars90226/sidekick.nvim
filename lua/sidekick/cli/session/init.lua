@@ -128,7 +128,11 @@ function M.setup()
   local session_backends =
     { tmux = "sidekick.cli.session.tmux", zellij = "sidekick.cli.session.zellij", herdr = "sidekick.cli.session.herdr" }
   for name, mod in pairs(session_backends) do
-    if vim.fn.executable(name) == 1 and (name ~= "herdr" or Config.cli.mux.backend == "herdr") then
+    if name == "herdr" and Config.cli.mux.backend == "herdr" then
+      -- Register even when the executable is missing so discovery can explain
+      -- the failure without offering to launch a different local tool.
+      M.register(name, require(mod))
+    elseif name ~= "herdr" and vim.fn.executable(name) == 1 then
       M.register(name, require(mod))
     end
   end
@@ -155,12 +159,22 @@ function M.sessions()
   for _, s in ipairs(ret) do
     sources[s.id] = s
   end
+  local active = {}
   for _, s in ipairs(ret) do
     local source = s.source_id and sources[s.source_id]
-    if source and s.parent and s.parent.same_owner and s.parent:same_owner(source) then
-      s.parent, s.cwd, s.sid = source, source.cwd, source.sid
+    if source and s.parent and s.parent.same_owner then
+      if s.parent:same_owner(source) then
+        -- Refresh metadata only for the same owner, including its display cwd.
+        s.parent, s.cwd, s.sid = source, source.cwd, source.sid
+      else
+        s:close() -- The live client must not keep hiding a replacement occupant.
+      end
+    end
+    if not s.closed then
+      active[#active + 1] = s
     end
   end
+  ret = active
   for id in pairs(M._attached) do
     if not ids[id] then -- session is no longer running
       M.detach(M._attached[id])

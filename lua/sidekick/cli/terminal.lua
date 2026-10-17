@@ -161,7 +161,11 @@ function M:start()
       self:close()
       error("Herdr attachment ended; select the agent again")
     end
-    assert(self.parent:validate(), "Herdr target changed; select the agent again")
+    local valid, reason = self.parent:validate()
+    if not valid then
+      self:close()
+      error("Herdr target unavailable: " .. tostring(reason) .. "; select the agent again")
+    end
   end
 
   self.buf = vim.api.nvim_create_buf(false, true)
@@ -206,14 +210,8 @@ function M:start()
     buffer = self.buf,
     callback = function()
       if self.manual_input then
-        local status = vim.v.event.status
+        self:report_exit(vim.v.event.status)
         vim.schedule(function()
-          if self.closed then
-            return
-          end
-          if status ~= 0 then
-            Util.error("Herdr attach client exited with status " .. status .. "; select the existing agent again")
-          end
           self:close()
         end)
         return
@@ -442,9 +440,12 @@ function M:is_focused()
 end
 
 function M:show()
-  if self.manual_input and not self.parent:validate() then
-    self:close()
-    error("Herdr occupant changed or became unavailable; select the agent again")
+  if self.manual_input then
+    local valid, reason = self.parent:validate()
+    if not valid then
+      self:close()
+      error("Herdr target unavailable: " .. tostring(reason) .. "; select the agent again")
+    end
   end
   self:start()
   if not self:is_running() then
@@ -481,9 +482,37 @@ function M:detach()
   return self
 end
 
+-- Preserve an attach failure before any cleanup path deletes its terminal buffer.
+function M:report_exit(status)
+  if self.closed or self.exit_reported then
+    return
+  end
+  if type(status) == "number" and status >= 0 then
+    self.exit_status = status
+  end
+  if self.exit_status == 0 then
+    return
+  end
+  self.exit_reported = true
+  local lines = self:buf_valid() and vim.api.nvim_buf_get_lines(self.buf, 0, -1, false) or {}
+  lines = vim.tbl_filter(function(line)
+    return line:match("%S") ~= nil
+  end, lines)
+  local tail = table.concat(vim.list_slice(lines, math.max(1, #lines - 2)), "\n"):sub(-800)
+  Util.error(
+    "Herdr attach client ended (status "
+      .. tostring(self.exit_status or "unknown")
+      .. "); select the existing agent again"
+      .. (tail ~= "" and (":\n" .. tail) or "")
+  )
+end
+
 function M:close()
   if self.closed then
     return self
+  end
+  if self.manual_input and self.job and not self:is_running() then
+    self:report_exit(vim.fn.jobwait({ self.job }, 0)[1])
   end
   self.closed = true
   self.send_queue = {}
