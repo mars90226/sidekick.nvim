@@ -508,7 +508,10 @@ local function probe(op)
             local path = visible and visible:match("[\r\n]" .. marker .. "([^\r\n]+)")
             if path then
               if path ~= op.executable then
-                return finish(op, "unknown", "Pane canonical executable differs from the expected local executable")
+                local reason = path:sub(1, 1) ~= "/"
+                    and "Pane canonical executable not found on PATH as an absolute path"
+                  or ("Pane canonical executable differs; expected: " .. op.executable)
+                return finish(op, "unknown", reason .. "; observed: " .. path)
               end
               start_agent(op)
             elseif attempts >= 10 or not visible then
@@ -574,6 +577,7 @@ local function plan(opts)
   Session.setup()
   local tool = assert(Config.tools()[opts.name], "Unknown CLI tool")
   local backend, cwd = Session.primary(), Session.cwd({ cwd = opts.cwd })
+  assert(Session.backends[backend], "Primary backend '" .. backend .. "' is unavailable (executable not found)")
   assert(vim.fn.isdirectory(cwd) == 1 and text(cwd), "New agent cwd must be an existing local directory")
   local env, args, secrets = {}, {}, {}
   local timeout = 30000

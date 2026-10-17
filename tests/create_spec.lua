@@ -109,6 +109,9 @@ local function respond(cmd)
     end
     return result({ result = { process_info = info } })
   elseif a[1] == "pane" and a[2] == "read" then
+    if state.marker and state.marker_prompt then
+      return result("\n" .. state.marker .. "shell$ ")
+    end
     if state.blank_reads and state.blank_reads > 0 then
       state.blank_reads = state.blank_reads - 1
       return result("")
@@ -172,6 +175,7 @@ getmetatable(T).opts.hooks = {
       terminals = Terminal.terminals,
       rename = vim.uv.fs_rename,
       exepath = vim.fn.exepath,
+      executable = vim.fn.executable,
       select = vim.ui.select,
       attach = Session.attach,
       backends = Session.backends,
@@ -263,7 +267,7 @@ getmetatable(T).opts.hooks = {
       end
     end
     Terminal.terminals = original.terminals
-    vim.fn.exepath = original.exepath
+    vim.fn.exepath, vim.fn.executable = original.exepath, original.executable
     Config.cli.primary_backend, Config.cli.discovery, Config.cli.mux, Config.cli.tools =
       original.primary, original.discovery, original.mux, original.tools
     Session.backends, Session.did_setup, Session._attached = original.backends, original.setup, original.attached
@@ -1498,6 +1502,48 @@ T["journal write exception still closes its descriptor"] = function()
   expect.equality(op.phase, "failed")
   expect.equality(closed, 1)
   expect.equality(calls, {})
+end
+
+T["missing pane executable reports PATH failure without starting agent"] = function()
+  state.marker_prompt = true
+  local op = wait(Create.new({ name = "codex" }))
+  expect.equality(op.phase, "unknown")
+  expect.equality(op.error:find("not found on PATH", 1, true) ~= nil, true)
+  expect.equality(op.error:find("shell$", 1, true) ~= nil, true)
+  expect.equality(count("agent", "start"), 0)
+end
+
+T["different pane executable reports observed and expected paths"] = function()
+  state.executable = "/different/codex"
+  local op = wait(Create.new({ name = "codex" }))
+  expect.equality(op.phase, "unknown")
+  expect.equality(op.error:find(op.executable, 1, true) ~= nil, true)
+  expect.equality(op.error:find(state.executable, 1, true) ~= nil, true)
+  expect.equality(count("agent", "start"), 0)
+end
+
+for _, backend in ipairs({ "tmux", "zellij" }) do
+  T["unavailable primary is rejected before journal and confirmation: " .. backend] = function()
+    Config.cli.primary_backend = backend
+    Session.did_setup, Session.backends = false, {}
+    vim.fn.executable = function()
+      return 0
+    end
+    local selected, opened = 0, 0
+    vim.ui.select = function()
+      selected = selected + 1
+    end
+    vim.uv.fs_open = function(...)
+      opened = opened + 1
+      return original.open(...)
+    end
+    local ok, err = pcall(Create.new, { name = "codex" })
+    expect.equality(ok, false)
+    expect.equality(tostring(err):find("unavailable", 1, true) ~= nil, true)
+    expect.equality(selected, 0)
+    expect.equality(opened, 0)
+    expect.equality(calls, {})
+  end
 end
 
 return T
