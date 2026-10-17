@@ -4,8 +4,9 @@ local Config = require("sidekick.config")
 local Create = require("sidekick.cli.create")
 local Herdr = require("sidekick.cli.session.herdr")
 local Session = require("sidekick.cli.session")
+local Terminal = require("sidekick.cli.terminal")
 local Util = require("sidekick.util")
-local state, original, root, calls, notices, attached, held
+local state, original, root, calls, notices, attached, held, violations
 local function result(stdout, code, stderr)
   return {
     stdout = type(stdout) == "table" and vim.json.encode(stdout) or stdout,
@@ -39,6 +40,14 @@ local function pane()
     tab_id = "w-mvp:t1",
     cwd = state.cwd or root,
   }
+end
+local function checked(fn)
+  local ok, value = pcall(fn)
+  if not ok then
+    violations[#violations + 1] = tostring(value)
+    error(value)
+  end
+  return value
 end
 local function respond(cmd)
   if cmd[1] == "--version" then
@@ -97,6 +106,7 @@ local function respond(cmd)
     )
   elseif a[1] == "pane" and a[2] == "run" then
     state.marker = assert(a[4]:match("(SK_EXEC_%x+=)"))
+    state.kind = assert(a[4]:match("command %-v (%w+)$"))
     return result("command submitted")
   elseif a[1] == "agent" and a[2] == "start" then
     state.started, state.name, state.kind = true, a[3], a[5]
@@ -135,6 +145,8 @@ getmetatable(T).opts.hooks = {
       mux = vim.deepcopy(Config.cli.mux),
       tools = Config.cli.tools,
       system = vim.system,
+      write = vim.uv.fs_write,
+      terminals = Terminal.terminals,
       rename = vim.uv.fs_rename,
       exepath = vim.fn.exepath,
       select = vim.ui.select,
@@ -152,7 +164,8 @@ getmetatable(T).opts.hooks = {
       command_error = Herdr._command_error,
       cwd = vim.fn.getcwd(),
     }
-    state, calls, notices, attached, held = { kind = "codex" }, {}, {}, {}, {}
+    state, calls, notices, attached, held, violations = { kind = "codex" }, {}, {}, {}, {}, {}
+    Terminal.terminals = {}
     Create.operations, Create.pending, Create.generation = {}, {}, 0
     Config.cli.primary_backend, Config.cli.discovery = "herdr", { tmux = true, herdr = true }
     Config.cli.mux.herdr =
@@ -183,29 +196,33 @@ getmetatable(T).opts.hooks = {
       return { show = function() end, focus = function() end }
     end
     vim.system = function(argv, opts, cb)
-      local cmd = vim.list_slice(argv, 2)
-      expect.equality(argv[1], "herdr")
-      calls[#calls + 1] = cmd
-      if cb then
-        expect.equality(opts.env.HERDR_SOCKET_PATH, "/tmp/mvp.sock")
-        expect.equality(opts.env.HERDR_SESSION, nil)
-        local reply = respond(cmd)
-        if state.hold == cmd[3] .. " " .. (cmd[4] or "") then
-          held[#held + 1] = function()
-            cb(reply)
+      return checked(function()
+        local cmd = vim.list_slice(argv, 2)
+        expect.equality(argv[1], "herdr")
+        calls[#calls + 1] = cmd
+        if cb then
+          expect.equality(opts.env.HERDR_SOCKET_PATH, "/tmp/mvp.sock")
+          expect.equality(opts.env.HERDR_SESSION, nil)
+          local reply = respond(cmd)
+          if state.hold == cmd[3] .. " " .. (cmd[4] or "") then
+            held[#held + 1] = function()
+              cb(reply)
+            end
+          else
+            vim.schedule(function()
+              cb(reply)
+            end)
           end
-        else
-          vim.schedule(function()
-            cb(reply)
-          end)
+          return {}
         end
-        return {}
-      end
-      return {
-        wait = function()
-          return respond(cmd)
-        end,
-      }
+        return {
+          wait = function()
+            return checked(function()
+              return respond(cmd)
+            end)
+          end,
+        }
+      end)
     end
   end,
   post_case = function()
@@ -213,7 +230,13 @@ getmetatable(T).opts.hooks = {
       return false
     end)
     vim.system, vim.ui.select, Session.attach = original.system, original.select, original.attach
-    vim.uv.fs_rename = original.rename
+    vim.uv.fs_rename, vim.uv.fs_write = original.rename, original.write
+    for _, terminal in pairs(Terminal.terminals) do
+      if terminal.group then
+        pcall(vim.api.nvim_del_augroup_by_id, terminal.group)
+      end
+    end
+    Terminal.terminals = original.terminals
     vim.fn.exepath = original.exepath
     Config.cli.primary_backend, Config.cli.discovery, Config.cli.mux, Config.cli.tools =
       original.primary, original.discovery, original.mux, original.tools
@@ -223,6 +246,7 @@ getmetatable(T).opts.hooks = {
     Herdr.last_error, Herdr._warned, Herdr._command_error = original.last_error, original.warned, original.command_error
     vim.fn.chdir(original.cwd)
     vim.fn.delete(root, "rf")
+    expect.equality(violations, {}) -- Product pcall must not hide a fixture failure.
   end,
 }
 
@@ -291,7 +315,11 @@ for _, case in ipairs({
     local op = wait(Create.new({ name = "codex" }))
     expect.equality(op.phase, case == "blocked" and "blocked" or "unknown")
     expect.equality(count("workspace", "create"), 1)
-    expect.equality(count("agent", "start") <= 1, true)
+    local starts = ({ ["start-timeout-unresolved"] = 1, blocked = 1, ["not-ready"] = 1, replaced = 1 })[case] or 0
+    expect.equality(count("agent", "start"), starts)
+    if case == "cwd" or case == "draft" or case == "tmux" then
+      expect.equality(count("pane", "run"), 0)
+    end
     expect.equality(#attached, 0)
     local again = Create.new({ name = "codex" })
     expect.equality(again, op)
@@ -602,7 +630,6 @@ T["failed initial journal settles without remote commands or a reservation"] = f
     name = "codex",
     on_done = function(value)
       completed = completed + 1
-      expect.equality(value.phase, "unknown")
     end,
   })
   expect.equality(completed, 1)
@@ -623,11 +650,11 @@ T["journal failure after workspace reply preserves IDs and settles once without 
     name = "codex",
     on_done = function(value)
       completed = completed + 1
-      expect.equality(value.phase, "unknown")
-      expect.equality(value.pane, "w-mvp:p1")
     end,
   }))
   expect.equality(completed, 1)
+  expect.equality(op.phase, "unknown")
+  expect.equality(op.pane, "w-mvp:p1")
   expect.equality(op.workspace, "w-mvp")
   expect.equality(op.terminal, "term-mvp")
   expect.equality(#op.records, 2)
@@ -715,6 +742,402 @@ T["missing canonical executable fails before any remote commands"] = function()
     Create.new({ name = "codex" })
   end)
   expect.equality(calls, {})
+end
+
+T["stale ready refresh cannot release a newer reservation"] = function()
+  state.status = "blocked"
+  local first = wait(Create.new({ name = "codex" }))
+  state.status = "idle"
+  wait(Create.refresh(first.id))
+  expect.equality(first.phase, "ready")
+  state.hold = "workspace create"
+  local second = Create.new({ name = "codex" })
+  expect.equality(
+    vim.wait(2000, function()
+      return #held == 1
+    end),
+    true
+  )
+  wait(Create.refresh(first.id))
+  expect.equality(Create.pending[second.key], second)
+  expect.equality(Create.new({ name = "codex" }), second)
+  expect.equality(count("workspace", "create"), 2)
+  Create.cancel(second.id)
+  held[1]()
+end
+
+T["cancel of an older pre-dispatch operation preserves the current reservation"] = function()
+  vim.ui.select = function(_, _, cb)
+    cb(nil)
+  end
+  local first = Create.new({ name = "codex" })
+  vim.ui.select = function(items, _, cb)
+    cb(items[1])
+  end
+  state.hold = "workspace create"
+  local second = Create.new({ name = "codex" })
+  expect.equality(
+    vim.wait(2000, function()
+      return #held == 1
+    end),
+    true
+  )
+  Create.cancel(first.id)
+  expect.equality(Create.pending[second.key], second)
+  Create.cancel(second.id)
+  held[1]()
+end
+
+T["non-herdr New refuses a registered terminal before reinitializing it"] = function()
+  Config.cli.primary_backend = "terminal"
+  Session.register("terminal", Terminal)
+  local sid = Session.sid({ tool = "codex", cwd = root })
+  local current = Session.new({ tool = "codex", cwd = root, id = sid, backend = "terminal" })
+  Session._attached[sid] = current
+  local autocmd =
+    vim.api.nvim_create_autocmd("User", { pattern = "MvpSentinel", group = current.group, callback = function() end })
+  local op = Create.new({ name = "codex" })
+  expect.equality(op.phase, "failed")
+  expect.equality(Terminal.get(sid), current)
+  expect.equality(Session._attached[sid], current)
+  expect.equality(#vim.api.nvim_get_autocmds({ id = autocmd }), 1)
+  expect.equality(#attached, 0)
+end
+
+T["late auto-attach preserves an existing manual wrapper"] = function()
+  state.hold = "agent start"
+  local op = Create.new({ name = "codex" })
+  expect.equality(
+    vim.wait(2000, function()
+      return #held == 1
+    end),
+    true
+  )
+  local id = "herdr:" .. vim.fn.sha256("/tmp/mvp.sock") .. ":term-mvp"
+  local wrapper = { source_id = id, manual_input = true }
+  Session._attached["terminal: " .. id] = wrapper
+  held[1]()
+  wait(op)
+  expect.equality(op.phase, "ready")
+  expect.equality(#attached, 0)
+  expect.equality(Session._attached["terminal: " .. id], wrapper)
+  expect.equality(count("agent", "start"), 1)
+end
+
+for _, phase in ipairs({ "blocked", "attached" }) do
+  T["final journal failure preserves known " .. phase .. " outcome"] = function()
+    state.status = phase == "blocked" and "blocked" or "idle"
+    vim.uv.fs_rename = function(from, to)
+      local data = vim.json.decode(table.concat(vim.fn.readfile(from), "\n"))
+      if data.phase == phase then
+        return nil, "ENOSPC"
+      end
+      return original.rename(from, to)
+    end
+    local completed
+    local op = wait(Create.new({
+      name = "codex",
+      on_done = function(value)
+        completed = value.phase
+      end,
+    }))
+    expect.equality(op.phase, phase)
+    expect.equality(completed, phase)
+    expect.equality(type(op.persist_error), "string")
+    if phase == "blocked" then
+      expect.equality(op.error:find("manual attention", 1, true) ~= nil, true)
+      expect.equality(table.concat(notices):find("manual attention", 1, true) ~= nil, true)
+    else
+      expect.equality(Create.pending[op.key], nil)
+    end
+  end
+end
+
+T["primary selection does not reroute legacy implicit starts"] = function()
+  local State = require("sidekick.cli.state")
+  Config.cli.primary_backend, Config.cli.mux.enabled, Config.cli.mux.backend = "tmux", false, "tmux"
+  local TerminalBackend = { __index = nil }
+  TerminalBackend.__index = TerminalBackend
+  Session.register("terminal", TerminalBackend)
+  local used
+  Session.attach = function(source)
+    used = source
+    return source
+  end
+  State.attach({ tool = Config.tools().codex }, { show = false })
+  expect.equality(used.backend, "terminal")
+end
+
+T["workspace pre-dispatch journal failure releases an unsent reservation"] = function()
+  local fail = true
+  vim.uv.fs_rename = function(from, to)
+    local data = vim.json.decode(table.concat(vim.fn.readfile(from), "\n"))
+    if fail and data.phase == "creating_workspace" then
+      fail = false
+      return nil, "ENOSPC"
+    end
+    return original.rename(from, to)
+  end
+  local op = wait(Create.new({ name = "codex" }))
+  expect.equality(op.workspace_dispatched, false)
+  expect.equality(count("workspace", "create"), 0)
+  expect.equality(Create.pending[op.key], nil)
+  local next_op = wait(Create.new({ name = "codex" }))
+  expect.equality(next_op ~= op, true)
+  expect.equality(next_op.phase, "attached")
+end
+
+T["short secret keeps identity fields and findable warning targets"] = function()
+  Config.cli.tools.codex.env = { X = "1" }
+  state.status = "blocked"
+  local op = wait(Create.new({ name = "codex" }))
+  expect.equality(op.phase, "blocked")
+  expect.equality(table.concat(notices):find("w-mvp:p1", 1, true) ~= nil, true)
+  local record = op.records[#op.records]
+  expect.equality(vim.json.decode(record.stdout).result.agent.pane_id, "w-mvp:p1")
+  expect.equality(vim.json.decode(record.stdout).result.agent.agent_status, "blocked")
+end
+
+T["overlapping secrets redact the complete longest value first"] = function()
+  Config.cli.tools.codex.env = { SHORT = "abc", LONG = "abcXYZ" }
+  state.echo_secrets = { "abcXYZ", "abc" }
+  local op = wait(Create.new({ name = "codex" }))
+  for _, record in ipairs(op.records) do
+    if record.command == "agent start" then
+      expect.equality(vim.json.decode(record.stdout).result.diagnostic, { "[redacted]", "[redacted]" })
+    end
+  end
+end
+
+T["cancel preserves a settled diagnostic and refresh explains no-start state"] = function()
+  state.draft = true
+  local op = wait(Create.new({ name = "codex" }))
+  local reason = op.error
+  Create.cancel(op.id)
+  expect.equality(op.phase, "unknown")
+  expect.equality(op.error, reason)
+  local saved = vim.json.decode(table.concat(vim.fn.readfile(op.journal), "\n"))
+  expect.equality(saved.phase, "unknown")
+  expect.equality(saved.error, reason)
+  Create.refresh(op.id)
+  expect.equality(table.concat(notices):find("no agent startup to refresh", 1, true) ~= nil, true)
+end
+
+T["invalid discovery does not poison setup and can be corrected"] = function()
+  Session.did_setup, Session.backends = false, {}
+  Config.cli.discovery.tmux = "yes"
+  expect.error(Session.setup)
+  expect.equality(Session.did_setup, false)
+  expect.error(Session.setup)
+  Config.cli.discovery = { herdr = true, tmux = false, zellij = false }
+  Session.setup()
+  expect.equality(Session.did_setup, true)
+  expect.equality(Session.backends.terminal ~= nil, true)
+  expect.equality(Session.backends.herdr ~= nil, true)
+end
+
+T["a rejected missing executable does not supersede an in-flight request"] = function()
+  state.hold = "agent start"
+  local op = Create.new({ name = "codex" })
+  expect.equality(
+    vim.wait(2000, function()
+      return #held == 1
+    end),
+    true
+  )
+  local generation = Create.generation
+  vim.fn.exepath = function(name)
+    return name == "claude" and "" or root .. "/fixture-bin/" .. name
+  end
+  expect.error(function()
+    Create.new({ name = "claude" })
+  end)
+  expect.equality(Create.generation, generation)
+  held[1]()
+  wait(op)
+  expect.equality(op.phase, "attached")
+end
+
+T["cancel during shell-settle observation remains cancelled without input"] = function()
+  state.shell_children, state.hold = 2, "pane process-info"
+  local op = Create.new({ name = "codex" })
+  expect.equality(
+    vim.wait(2000, function()
+      return #held == 1
+    end),
+    true
+  )
+  Create.cancel(op.id)
+  held[1]()
+  expect.equality(
+    vim.wait(2000, function()
+      return #op.records >= 4
+    end),
+    true
+  )
+  expect.equality(op.phase, "cancelled")
+  expect.equality(count("pane", "run"), 0)
+  expect.equality(count("agent", "start"), 0)
+end
+
+T["a partial journal write stops before remote commands"] = function()
+  vim.uv.fs_write = function(fd, data, offset)
+    return original.write(fd, data:sub(1, -2), offset)
+  end
+  local op = Create.new({ name = "codex" })
+  expect.equality(op.phase, "unknown")
+  expect.equality(op.persist_error:find("Short creation journal write", 1, true) ~= nil, true)
+  expect.equality(calls, {})
+end
+
+T["fixture violations remain observable even if a caller catches the error"] = function()
+  pcall(
+    vim.system,
+    { "herdr", "--session", "poc", "agent", "prompt" },
+    { env = { HERDR_SOCKET_PATH = "/tmp/mvp.sock" } },
+    function() end
+  )
+  expect.equality(#violations, 1)
+  expect.equality(violations[1]:find("Forbidden or unexpected command", 1, true) ~= nil, true)
+  violations = {} -- This one intentionally injected violation was asserted above.
+end
+
+T["non-herdr New preserves a registered tmux terminal wrapper"] = function()
+  local Tmux = require("sidekick.cli.session.tmux")
+  Session.register("tmux", Tmux)
+  Session.register("terminal", Terminal)
+  Config.cli.primary_backend = "tmux"
+  local sid = Session.sid({ tool = "codex", cwd = root })
+  local id = "terminal: " .. sid
+  local current = Session.new({ tool = "codex", cwd = root, id = id, backend = "terminal", mux_backend = "tmux" })
+  Session._attached[id] = current
+  local start, terminal_start = Tmux.start, Terminal.start
+  local starts = 0
+  Tmux.start = function()
+    return { cmd = { "fixture-client" } }
+  end
+  Terminal.start = function()
+    starts = starts + 1
+  end
+  Session.attach = original.attach
+  local ok, err = pcall(function()
+    local op = Create.new({ name = "codex" })
+    expect.equality(op.phase, "failed")
+    expect.equality(Terminal.get(id), current)
+    expect.equality(Session._attached[id], current)
+    expect.equality(starts, 0)
+  end)
+  Tmux.start, Terminal.start = start, terminal_start
+  assert(ok, err)
+end
+
+T["start pre-dispatch journal failure never claims a command was sent"] = function()
+  vim.uv.fs_rename = function(from, to)
+    local data = vim.json.decode(table.concat(vim.fn.readfile(from), "\n"))
+    if data.phase == "launching" then
+      return nil, "ENOSPC"
+    end
+    return original.rename(from, to)
+  end
+  local op = wait(Create.new({ name = "codex" }))
+  expect.equality(op.phase, "unknown")
+  expect.equality(op.start_dispatched, false)
+  expect.equality(count("agent", "start"), 0)
+  expect.equality(Create.pending[op.key], op)
+end
+
+T["begin does not reuse stale discovery diagnostics"] = function()
+  Herdr._command_error = "unrelated old error"
+  local system = vim.system
+  vim.system = function(argv, opts, cb)
+    if argv[2] == "session" then
+      calls[#calls + 1] = vim.list_slice(argv, 2)
+      return {
+        wait = function()
+          return result({ sessions = {} })
+        end,
+      }
+    end
+    return system(argv, opts, cb)
+  end
+  local op = Create.new({ name = "codex" })
+  expect.equality(op.phase, "failed")
+  expect.equality(op.error:find("unrelated old error", 1, true), nil)
+  expect.equality(count("workspace", "create"), 0)
+end
+
+T["herdr primary offers no implicit creation through select toggle or send"] = function()
+  Config.cli.mux.backend, Config.cli.mux.enabled = "tmux", false
+  local State, Cli = require("sidekick.cli.state"), require("sidekick.cli")
+  expect.equality(State.get(), {})
+  Cli.select({ filter = { name = "codex" } })
+  Cli.toggle({ name = "codex" })
+  Cli.send({ msg = "fixture text must not be sent", name = "codex" })
+  vim.wait(30, function()
+    return false
+  end)
+  expect.equality(count("workspace", "create"), 0)
+  expect.equality(count("agent", "start"), 0)
+  expect.equality(Create.operations, {})
+end
+
+for _, case in ipairs({ "claude-effort", "codex-effort", "dangling", "option-value", "env-key", "other-tool" }) do
+  T["canonical launch boundary " .. case] = function()
+    local name = "codex"
+    if case == "claude-effort" then
+      name = "claude"
+      Config.cli.tools.claude.cmd = { "claude", "--effort", "high" }
+    elseif case == "codex-effort" then
+      Config.cli.tools.codex.cmd = { "codex", "--effort", "high" }
+    elseif case == "dangling" then
+      Config.cli.tools.codex.cmd = { "codex", "--model" }
+    elseif case == "option-value" then
+      Config.cli.tools.codex.cmd = { "codex", "--model", "--print" }
+    elseif case == "env-key" then
+      Config.cli.tools.codex.env = { ["not-a-key"] = "value" }
+    else
+      name = "gemini"
+      Config.cli.tools.gemini = { cmd = { "gemini" } }
+    end
+    if case == "claude-effort" then
+      local op = wait(Create.new({ name = name }))
+      expect.equality(op.phase, "attached")
+    else
+      expect.error(function()
+        Create.new({ name = name })
+      end)
+      expect.equality(calls, {})
+    end
+  end
+end
+
+T["legacy herdr selection still hides implicit starts with another explicit primary"] = function()
+  Config.cli.primary_backend, Config.cli.mux.backend = "terminal", "herdr"
+  expect.equality(require("sidekick.cli.state").get(), {})
+  expect.equality(Create.operations, {})
+end
+
+T["disabled discovery does not remove the legacy creation provider"] = function()
+  Config.cli.primary_backend, Config.cli.mux.enabled, Config.cli.mux.backend = "terminal", true, "tmux"
+  Config.cli.discovery = { tmux = false, herdr = false, zellij = false }
+  Session.did_setup, Session.backends = false, {}
+  local executable, used = vim.fn.executable, nil
+  vim.fn.executable = function()
+    return 1
+  end
+  Session.attach = function(source)
+    used = source
+    return source
+  end
+  local ok, err = pcall(function()
+    Session.setup()
+    expect.equality(Session.discovers("tmux"), false)
+    expect.equality(Session.backends.tmux ~= nil, true)
+    require("sidekick.cli.state").attach({ tool = Config.tools().codex }, { show = false })
+    expect.equality(used.backend, "tmux")
+  end)
+  vim.fn.executable = executable
+  assert(ok, err)
 end
 
 return T

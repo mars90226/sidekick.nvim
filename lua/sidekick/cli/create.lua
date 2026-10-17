@@ -6,7 +6,7 @@ local Util = require("sidekick.util")
 -- Explicit creation only. Discovery, send and terminal restart never enter here.
 local M = { operations = {}, pending = {}, generation = 0 }
 local sequence = 0
-local shells = { bash = true, zsh = true, fish = true, sh = true, dash = true }
+local shells = { bash = true, zsh = true, sh = true, dash = true }
 
 local function text(value)
   return type(value) == "string" and value ~= "" and not value:find("[%z\1-\31\127]")
@@ -26,8 +26,46 @@ local function redact(op, value)
   return value
 end
 
+-- Preserve operational metadata while sanitizing configured values elsewhere.
+local identity_fields = {
+  pane_id = true,
+  terminal_id = true,
+  workspace_id = true,
+  tab_id = true,
+  name = true,
+  agent = true,
+  cwd = true,
+  foreground_cwd = true,
+  socket = true,
+  socket_path = true,
+  agent_status = true,
+  status = true,
+  version = true,
+  type = true,
+}
+local function redact_reply(op, value, json)
+  if not json then
+    return redact(op, value)
+  end
+  local ok, decoded = pcall(vim.json.decode, value or "")
+  if not ok or type(decoded) ~= "table" then
+    return redact(op, value)
+  end
+  local function sanitize(node)
+    for key, child in pairs(node) do
+      if type(child) == "table" then
+        sanitize(child)
+      elseif type(child) == "string" and not identity_fields[key] then
+        node[key] = redact(op, child)
+      end
+    end
+  end
+  sanitize(decoded)
+  return vim.json.encode(decoded)
+end
+
 local function complete(op)
-  if op.phase == "attached" or op.phase == "ready" or not op.workspace_dispatched then
+  if M.pending[op.key] == op and (op.phase == "attached" or op.phase == "ready" or not op.workspace_dispatched) then
     M.pending[op.key] = nil
   end
   if not op.notified and op.on_done then
@@ -52,7 +90,8 @@ local function capture_workspace(op, value)
   return true
 end
 
-local function save(op)
+local function save(op, preserve_outcome)
+  op.persist_error = nil
   local data = {}
   for _, key in ipairs({
     "id",
@@ -62,6 +101,7 @@ local function save(op)
     "cwd",
     "phase",
     "error",
+    "persist_error",
     "endpoint",
     "workspace",
     "pane",
@@ -78,23 +118,38 @@ local function save(op)
     local dir = vim.fs.dirname(op.journal)
     vim.fn.mkdir(dir, "p", 448)
     local fd = assert(vim.uv.fs_open(op.journal .. ".tmp", "w", 384))
-    local written, why = vim.uv.fs_write(fd, vim.json.encode(data) .. "\n", 0)
+    local encoded = vim.json.encode(data) .. "\n"
+    local written, why = vim.uv.fs_write(fd, encoded, 0)
     vim.uv.fs_close(fd)
-    assert(written, why)
+    assert(written == #encoded, why or "Short creation journal write")
     assert(vim.uv.fs_rename(op.journal .. ".tmp", op.journal))
   end)
   if not ok then
-    op.phase, op.error = "unknown", "Cannot save creation journal: " .. tostring(err)
-    Util.error(op.error .. "; inspect operation " .. op.id)
+    op.persist_error = "Cannot save creation journal: " .. tostring(err)
+    if not preserve_outcome then
+      op.phase, op.error = "unknown", op.error or op.persist_error
+    end
+    Util.error(op.persist_error .. "; inspect operation " .. op.id)
   end
   return ok
 end
 
 local function finish(op, phase, reason)
   op.phase, op.error = phase, reason and redact(op, reason) or nil
-  save(op)
+  save(op, true)
   if reason then
-    Util.warn("New " .. op.tool .. ": " .. op.error .. "; operation " .. op.id .. ", journal " .. op.journal)
+    Util.warn(
+      "New "
+        .. op.tool
+        .. ": "
+        .. op.error
+        .. (op.pane and ("; pane " .. op.pane) or "")
+        .. (op.persist_error and ("; " .. op.persist_error) or "")
+        .. "; operation "
+        .. op.id
+        .. ", journal "
+        .. op.journal
+    )
   end
   complete(op)
 end
@@ -120,7 +175,7 @@ local function call(op, args, timeout, json, cb)
       op.records[#op.records + 1] = {
         command = args[1] .. " " .. (args[2] or ""),
         code = result.code,
-        stdout = redact(op, result.stdout),
+        stdout = redact_reply(op, result.stdout, json),
         stderr = redact(op, result.stderr),
       }
       local persisted = save(op)
@@ -217,6 +272,9 @@ local function check_shell(op, cb)
     local function read_process()
       shell_attempts = shell_attempts + 1
       call(op, { "pane", "process-info", "--pane", op.pane }, 2000, true, function(process, why)
+        if op.cancelled then
+          return finish(op, "cancelled", "Created shell is preserved; no agent started")
+        end
         local info = process and process.result and process.result.process_info
         -- Shell startup/prompt rendering may briefly have child commands in the
         -- shell's foreground group. Wait without input until only its shell remains.
@@ -307,6 +365,11 @@ local function verify(op, attach)
     if not attach or op.cancelled or op.generation ~= M.generation then
       return finish(op, "ready", "Agent is ready; select the existing session explicitly")
     end
+    for _, existing in pairs(Session._attached) do
+      if existing.source_id == source.id then
+        return finish(op, "ready", "Agent already has a registered attachment; select it explicitly")
+      end
+    end
     local ok, result = pcall(function()
       local terminal = Session.attach(source)
       terminal:show()
@@ -329,6 +392,7 @@ local function start_agent(op)
       assert(not op.start_dispatched, "Agent start already dispatched")
       op.phase, op.start_dispatched = "launching", true
       if not save(op) then
+        op.start_dispatched = false -- The start command has not been invoked.
         return complete(op)
       end
       local args =
@@ -389,6 +453,7 @@ local function begin(op)
     return
   end
   op.phase = "checking_server"
+  Herdr._command_error = nil
   local endpoint = Herdr.endpoint()
   local snapshot = endpoint and Herdr.snapshot(endpoint)
   if not snapshot then
@@ -398,6 +463,7 @@ local function begin(op)
   server(op, function()
     op.phase, op.workspace_dispatched = "creating_workspace", true
     if not save(op) then
+      op.workspace_dispatched = false -- No command was invoked; release this reservation.
       return complete(op)
     end
     local args =
@@ -474,14 +540,26 @@ local function plan(opts)
   local key = backend .. "\0" .. opts.name .. "\0" .. cwd
   if M.pending[key] then
     local previous = M.pending[key]
-    Util.warn("Creation already exists for this tool/cwd; inspect/refresh operation " .. previous.id)
+    Util.warn(
+      "Creation already exists for this tool/cwd; operation "
+        .. previous.id
+        .. " is "
+        .. previous.phase
+        .. (
+          previous.start_dispatched and "; inspect/refresh its startup"
+          or "; no agent start dispatched, inspect its journal"
+        )
+    )
     return previous, true
   end
+  local executable = backend == "herdr" and vim.fn.exepath(opts.name) or nil
+  assert(backend ~= "herdr" or text(executable), "Canonical agent executable is unavailable locally")
+  table.sort(secrets, function(a, b)
+    return #a > #b
+  end)
   sequence = sequence + 1
   M.generation = M.generation + 1
   local id = vim.fn.sha256(tostring(vim.uv.hrtime()) .. ":" .. vim.fn.getpid() .. ":" .. sequence):sub(1, 16)
-  local executable = backend == "herdr" and vim.fn.exepath(opts.name) or nil
-  assert(backend ~= "herdr" or text(executable), "Canonical agent executable is unavailable locally")
   local op = {
     id = id,
     name = "sk-" .. opts.name .. "-" .. id,
@@ -545,6 +623,17 @@ function M.new(opts)
       begin(op)
     else
       local ok, err = pcall(function()
+        local sid = Session.sid({ tool = op.tool, cwd = op.cwd })
+        local Terminal = require("sidekick.cli.terminal")
+        assert(
+          not (
+              Session._attached[sid]
+              or Session._attached["terminal: " .. sid]
+              or Terminal.get(sid)
+              or Terminal.get("terminal: " .. sid)
+            ),
+          "A session is already registered for this tool/cwd; select it explicitly"
+        )
         local session = Session.attach(Session.new({ tool = op.tool, cwd = op.cwd, backend = op.backend }))
         if session.show then
           session:show()
@@ -560,11 +649,15 @@ function M.new(opts)
   return op
 end
 
--- Cancellation stops observation/automatic attachment, never an agent or CLI request.
+-- Cancellation prevents future input/automatic attachment; late replies are still recorded.
 function M.cancel(id)
   local op = assert(M.operations[id], "Unknown creation operation")
   op.cancelled = true
-  finish(op, "cancelled", "Created resources, if any, are preserved")
+  if vim.tbl_contains({ "unknown", "blocked", "ready", "attached", "failed", "cancelled" }, op.phase) then
+    save(op, true) -- Preserve an already observed outcome and its diagnostics.
+  else
+    finish(op, "cancelled", "Created resources, if any, are preserved")
+  end
   return op
 end
 
@@ -572,6 +665,15 @@ end
 function M.refresh(id)
   local op = assert(M.operations[id], "Unknown creation operation; inspect its saved journal")
   if not op.start_dispatched or not op.pane then
+    Util.warn(
+      "Operation "
+        .. op.id
+        .. " is "
+        .. op.phase
+        .. "; no agent startup to refresh; inspect journal "
+        .. op.journal
+        .. (op.workspace and ("; workspace " .. op.workspace .. " is preserved") or "")
+    )
     return op
   end
   if not vim.tbl_contains({ "unknown", "blocked", "ready", "cancelled" }, op.phase) then

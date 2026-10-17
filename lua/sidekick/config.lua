@@ -36,6 +36,8 @@ local defaults = {
     -- Primary backend for explicit `require("sidekick.cli").new()` requests.
     -- nil preserves the existing mux.enabled/backend behavior. Existing sessions
     -- always use their own source backend, regardless of this setting.
+    -- A herdr primary or legacy mux backend hides not-started rows, so these
+    -- actions cannot implicitly create a tool or fall back to a local process.
     primary_backend = nil, ---@type "terminal"|"tmux"|"zellij"|"herdr"?
     -- Optional discovery overrides, independent of the primary backend.
     -- Unset providers retain their defaults; terminal wrappers are always tracked.
@@ -119,7 +121,8 @@ local defaults = {
         -- Existing running herdr server name, matching letters/digits/_/-.
         session = "default", ---@type string
         -- Opt-in creation through the explicit New action only. Each request
-        -- creates a dedicated workspace in the existing server, using Neovim cwd.
+        -- creates a dedicated workspace in the existing server, using request cwd
+        -- (default: Neovim cwd captured before tool selection).
         -- Only canonical interactive claude/codex commands with --model (and
         -- Claude --effort) are supported. No prompt/resume/wrapper or env unsets.
         -- Timeout/blocked outcomes are retained, never retried or sent to tmux.
@@ -129,7 +132,10 @@ local defaults = {
         -- observes startup again, cancel(id) stops automatic attachment. Neither
         -- retries creation nor terminates resources. Unresolved tool/cwd requests
         -- stay reserved for this Neovim process. Journals under stdpath("state")/
-        -- sidekick/herdr-create retain IDs and redacted replies across restarts;
+        -- sidekick/herdr-create retain IDs and replies with configured cmd/env
+        -- values redacted except operational metadata. Plain shell prompt
+        -- detection is conservative; fish/continuation `>` prompts are unsupported.
+        -- Journals retain evidence across restarts;
         -- they are evidence, not automatic recovery or remote idempotency keys.
         create = {
           enabled = false,

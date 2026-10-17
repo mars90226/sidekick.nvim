@@ -68,10 +68,11 @@ function M.prompt(opts)
 end
 
 --- Explicitly create a new agent using the primary backend, after confirmation.
---- Herdr creates a dedicated workspace; other backends retain their usual start behavior.
+--- Herdr creates a dedicated workspace; other backends refuse a matching registered session.
 --- send/select never call this action. The returned herdr operation has id/phase/journal.
 ---@param opts? {name?:string, cwd?:string, focus?:boolean, on_done?:fun(op:table)}
----@return table? operation Nil while choosing a tool; on_done reports the first settled outcome.
+---@return table? operation Nil while choosing a tool. on_done runs once for a newly planned operation;
+--- dismissed tool pickers, raised validation errors and deduplicated calls do not invoke a new callback.
 function M.new(opts)
   return require("sidekick.cli.create").new(opts)
 end
