@@ -1,5 +1,8 @@
 local T = require("mini.test").new_set()
 local expect = MiniTest.expect
+if vim.uv.os_uname().sysname ~= "Linux" then
+  return T -- The local herdr process-identity fixture requires /proc.
+end
 local Config = require("sidekick.config")
 local Create = require("sidekick.cli.create")
 local Herdr = require("sidekick.cli.session.herdr")
@@ -28,6 +31,7 @@ local function agent()
     workspace_id = "w-mvp",
     tab_id = "w-mvp:t1",
     cwd = root,
+    foreground_cwd = state.foreground_null and vim.NIL or nil,
     agent_status = state.status or "idle",
     interactive_ready = state.ready ~= false,
   }
@@ -39,6 +43,7 @@ local function pane()
     workspace_id = "w-mvp",
     tab_id = "w-mvp:t1",
     cwd = state.cwd or root,
+    foreground_cwd = state.foreground_null and vim.NIL or nil,
   }
 end
 local function checked(fn)
@@ -80,12 +85,21 @@ local function respond(cmd)
   elseif a[1] == "pane" and a[2] == "get" then
     return result({ result = { pane = pane() } })
   elseif a[1] == "pane" and a[2] == "process-info" then
+    if state.started and state.process_error then
+      return result({ error = { message = "synthetic process query failure" } }, 1, "synthetic process query failure")
+    end
     local info = {
       pane_id = "w-mvp:p1",
       shell_pid = 1,
-      foreground_process_group_id = state.started and vim.fn.getpid() or 1,
+      foreground_process_group_id = state.started and not state.return_to_shell and vim.fn.getpid() or 1,
       foreground_processes = { { pid = 1, name = state.shell_name or "bash", cwd = root } },
     }
+    if state.null_process_entry then
+      info.foreground_processes = { vim.NIL }
+    end
+    if state.null_process_child then
+      info.foreground_processes[2] = vim.NIL
+    end
     if state.shell_children and state.shell_children > 0 then
       state.shell_children = state.shell_children - 1
       table.insert(info.foreground_processes, { pid = 2, name = "starship", cwd = root })
@@ -372,6 +386,10 @@ T["late workspace response preserves ownership after cancellation without start"
   expect.equality(op.workspace, "w-mvp")
   expect.equality(op.phase, "cancelled")
   expect.equality(count("agent", "start"), 0)
+  vim.wait(30, function()
+    return false
+  end)
+  expect.equality(count("pane", "get"), 0)
 end
 
 T["double confirmation and duplicate in flight New dispatch only once"] = function()
@@ -1138,6 +1156,152 @@ T["disabled discovery does not remove the legacy creation provider"] = function(
   end)
   vim.fn.executable = executable
   assert(ok, err)
+end
+
+for _, category in ipairs({ "workspace create", "pane get", "pane process-info", "agent get" }) do
+  T["null result settles once rather than crashing: " .. category] = function()
+    local system = vim.system
+    vim.system = function(argv, opts, cb)
+      local command = (argv[4] or "") .. " " .. (argv[5] or "")
+      if cb and command == category then
+        calls[#calls + 1] = vim.list_slice(argv, 2)
+        vim.schedule(function()
+          cb(result({ result = vim.NIL }))
+        end)
+        return {}
+      end
+      return system(argv, opts, cb)
+    end
+    local completed = 0
+    local op = wait(Create.new({
+      name = "codex",
+      on_done = function()
+        completed = completed + 1
+      end,
+    }))
+    expect.equality(op.phase, "unknown")
+    expect.equality(completed, 1)
+    expect.equality(#attached, 0)
+    expect.equality(count("agent", "start"), category == "agent get" and 1 or 0)
+  end
+end
+
+for _, field in ipairs({ "null_process_entry", "null_process_child" }) do
+  T["null process list member fails closed: " .. field] = function()
+    state[field] = true
+    local op = wait(Create.new({ name = "codex" }))
+    expect.equality(op.phase, "unknown")
+    expect.equality(count("pane", "run"), 0)
+    expect.equality(count("agent", "start"), 0)
+  end
+end
+
+T["invalid start result can reconcile the same positively ready agent once"] = function()
+  local system = vim.system
+  vim.system = function(argv, opts, cb)
+    if cb and argv[4] == "agent" and argv[5] == "start" then
+      calls[#calls + 1] = vim.list_slice(argv, 2)
+      state.started, state.name, state.kind = true, argv[6], argv[8]
+      vim.schedule(function()
+        cb(result({ result = vim.NIL }))
+      end)
+      return {}
+    end
+    return system(argv, opts, cb)
+  end
+  local op = wait(Create.new({ name = "codex" }))
+  expect.equality(op.phase, "attached")
+  expect.equality(count("agent", "start"), 1)
+end
+
+for _, kind in ipairs({ "query-failed", "shell", "success" }) do
+  T["final identity evidence is recorded: " .. kind] = function()
+    state.process_error = kind == "query-failed"
+    state.return_to_shell = kind == "shell"
+    local op = wait(Create.new({ name = "codex" }))
+    local record = op.records[#op.records]
+    expect.equality(record.command, "pane process-info")
+    expect.equality(record.kind, "identity")
+    if kind == "success" then
+      expect.equality(op.phase, "attached")
+      expect.equality(record.process_identity.group, vim.fn.getpid())
+    else
+      expect.equality(op.phase, "unknown")
+      local marker = kind == "shell" and "back at its shell" or "synthetic process query failure"
+      expect.equality(op.error:find(marker, 1, true) ~= nil, true)
+      expect.equality(record.reason ~= nil, true)
+      expect.equality(#attached, 0)
+    end
+  end
+end
+
+T["cancel while checking initial server never creates a workspace"] = function()
+  state.hold = "status server"
+  local op = Create.new({ name = "codex" })
+  expect.equality(
+    vim.wait(2000, function()
+      return #held == 1
+    end),
+    true
+  )
+  Create.cancel(op.id)
+  held[1]()
+  expect.equality(
+    vim.wait(2000, function()
+      return #op.records == 1
+    end),
+    true
+  )
+  expect.equality(op.phase, "cancelled")
+  expect.equality(count("workspace", "create"), 0)
+  expect.equality(count("agent", "start"), 0)
+end
+
+T["late confirmation after cancel has no remote calls"] = function()
+  local confirm
+  vim.ui.select = function(_, _, cb)
+    confirm = cb
+  end
+  local op = Create.new({ name = "codex" })
+  Create.cancel(op.id)
+  confirm(op)
+  expect.equality(op.phase, "cancelled")
+  expect.equality(calls, {})
+end
+
+T["fresh non-herdr New uses explicit primary and releases its reservation"] = function()
+  Config.cli.primary_backend = "terminal"
+  Session.register("terminal", Terminal)
+  local used, shown, completed
+  Session.attach = function(source)
+    used = source
+    return {
+      show = function()
+        shown = true
+      end,
+    }
+  end
+  local op = Create.new({
+    name = "codex",
+    focus = false,
+    on_done = function(value)
+      completed = value.phase
+    end,
+  })
+  expect.equality(op.phase, "attached")
+  expect.equality(used.backend, "terminal")
+  expect.equality(shown, true)
+  expect.equality(completed, "attached")
+  expect.equality(Create.pending[op.key], nil)
+  expect.equality(calls, {})
+end
+
+T["nullable foreground cwd falls back to the reported cwd consistently"] = function()
+  state.foreground_null = true
+  local op = wait(Create.new({ name = "codex" }))
+  expect.equality(op.phase, "attached")
+  expect.equality(attached[1].cwd, root)
+  expect.equality(count("agent", "start"), 1)
 end
 
 return T

@@ -589,15 +589,17 @@ require("sidekick.cli").hide(opts)
 ```
 
 </td></tr>
-<tr><td> Explicitly create a new agent using the primary backend, after confirmation.
-Herdr creates a dedicated workspace; other backends refuse a matching registered session.
-send/select never call this action. The returned herdr operation has id/phase/journal.
-dismissed tool pickers, raised validation errors and deduplicated calls do not invoke a new callback.</td><td>
+<tr><td> Open a CLI using the primary backend, after confirmation.
+Herdr creates a dedicated workspace. tmux/zellij may reuse an existing mux
+session with the same tool/cwd name; matching registered sessions are refused.
+send/select never call this action. Returned operations have id/phase/journal.
+on_done runs once for a newly planned operation. Dismissed tool pickers,
+raised validation errors and deduplicated calls do not invoke a new callback.</td><td>
 
 
 ```lua
 ---@param opts? {name?:string, cwd?:string, focus?:boolean, on_done?:fun(op:table)}
----@return table? operation Nil while choosing a tool. on_done runs once for a newly planned operation;
+---@return table? operation Nil while choosing a tool.
 require("sidekick.cli").new(opts)
 ```
 

@@ -12,6 +12,10 @@ local function text(value)
   return type(value) == "string" and value ~= "" and not value:find("[%z\1-\31\127]")
 end
 
+local function reported_cwd(value)
+  return type(value.foreground_cwd) == "string" and value.foreground_cwd ~= "" and value.foreground_cwd or value.cwd
+end
+
 local function same_cwd(a, b)
   return type(a) == "string" and vim.uv.fs_realpath(a) == b
 end
@@ -190,6 +194,9 @@ local function call(op, args, timeout, json, cb)
         value = result.stdout or ""
       end
       local failure = result.code ~= 0 or not value or (json and value.error ~= nil and value.error ~= vim.NIL)
+      if json and value and args[1] ~= "status" and type(value.result) ~= "table" then
+        failure = true -- null/primitive success envelopes are not usable replies.
+      end
       if not persisted then
         if not failure and args[1] == "workspace" and args[2] == "create" then
           capture_workspace(op, value)
@@ -235,7 +242,7 @@ local function pane_matches(op, pane)
     and pane.terminal_id == op.terminal
     and pane.workspace_id == op.workspace
     and pane.tab_id == op.tab
-    and same_cwd(pane.foreground_cwd or pane.cwd, op.real_cwd)
+    and same_cwd(reported_cwd(pane), op.real_cwd)
 end
 
 local function shell_matches(op, info)
@@ -252,7 +259,10 @@ local function shell_matches(op, info)
     return false
   end
   local proc = info.foreground_processes[1]
-  return proc.pid == info.shell_pid and shells[proc.name] == true and same_cwd(proc.cwd, op.real_cwd)
+  return type(proc) == "table"
+    and proc.pid == info.shell_pid
+    and shells[proc.name] == true
+    and same_cwd(proc.cwd, op.real_cwd)
 end
 
 local function empty_prompt(visible)
@@ -288,6 +298,10 @@ local function check_shell(op, cb)
         then
           local shell_present, same_directory = false, true
           for _, proc in ipairs(info.foreground_processes) do
+            if type(proc) ~= "table" then
+              same_directory = false
+              break
+            end
             same_directory = same_directory and same_cwd(proc.cwd, op.real_cwd)
             shell_present = shell_present or (proc.pid == info.shell_pid and shells[proc.name] == true)
           end
@@ -345,16 +359,29 @@ local function verify(op, attach)
     then
       return finish(op, "unknown", "Agent is not confirmed ready; inspect " .. op.pane .. " and refresh")
     end
-    local process = Herdr.process_identity(op.endpoint, op.pane)
+    Herdr._command_error = nil
+    local process, foreground = Herdr.process_identity(op.endpoint, op.pane)
+    local reason = not process
+        and (foreground or Herdr._command_error or "Process identity/query evidence is unavailable")
+      or nil
+    op.records[#op.records + 1] = {
+      command = "pane process-info",
+      kind = "identity",
+      process_identity = process,
+      reason = reason and redact(op, reason) or nil,
+    }
+    if not save(op) then
+      return complete(op)
+    end
     if not process then
-      return finish(op, "unknown", "Agent foreground process is unavailable")
+      return finish(op, "unknown", foreground == "shell" and "Agent exited; pane is back at its shell" or reason)
     end
     local source = Session.new({
       id = "herdr:" .. vim.fn.sha256(op.endpoint.socket) .. ":" .. op.terminal,
       backend = "herdr",
       started = true,
       tool = op.tool,
-      cwd = agent.foreground_cwd or agent.cwd,
+      cwd = reported_cwd(agent),
       endpoint = op.endpoint,
       binding = Herdr.binding(agent),
       process_identity = process,
@@ -608,7 +635,8 @@ function M.new(opts)
   end
   op.phase = "confirming"
   vim.ui.select({ op }, {
-    prompt = "Create new agent?",
+    prompt = (op.backend == "tmux" or op.backend == "zellij") and "Open mux session (may reuse existing)?"
+      or "Create new agent?",
     format_item = function()
       return op.tool .. " via " .. op.backend .. " in " .. op.cwd
     end,

@@ -67,12 +67,14 @@ function M.prompt(opts)
   require("sidekick.cli.ui.prompt").select(opts)
 end
 
---- Explicitly create a new agent using the primary backend, after confirmation.
---- Herdr creates a dedicated workspace; other backends refuse a matching registered session.
---- send/select never call this action. The returned herdr operation has id/phase/journal.
+--- Open a CLI using the primary backend, after confirmation.
+--- Herdr creates a dedicated workspace. tmux/zellij may reuse an existing mux
+--- session with the same tool/cwd name; matching registered sessions are refused.
+--- send/select never call this action. Returned operations have id/phase/journal.
+--- on_done runs once for a newly planned operation. Dismissed tool pickers,
+--- raised validation errors and deduplicated calls do not invoke a new callback.
 ---@param opts? {name?:string, cwd?:string, focus?:boolean, on_done?:fun(op:table)}
----@return table? operation Nil while choosing a tool. on_done runs once for a newly planned operation;
---- dismissed tool pickers, raised validation errors and deduplicated calls do not invoke a new callback.
+---@return table? operation Nil while choosing a tool.
 function M.new(opts)
   return require("sidekick.cli.create").new(opts)
 end
