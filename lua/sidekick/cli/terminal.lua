@@ -110,6 +110,10 @@ function M.new(opts)
 end
 
 function M:init()
+  assert(
+    not self.manual_input or (self.parent and type(self.parent.validate) == "function"),
+    "Herdr manual attachment requires a parent with validate()"
+  )
   self.opts = vim.deepcopy(Config.cli.win)
   self.ctime = vim.uv.hrtime()
   self.atime = self.ctime

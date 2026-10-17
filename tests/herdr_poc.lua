@@ -664,4 +664,124 @@ T["second validation failure unregisters never-started wrapper"] = function()
   expect.equality(Terminal.terminals, {})
 end
 
+for _, case in ipairs({ "non-agent", "empty", "other-process-unknown" }) do
+  T["confirmed absence retires wrapper " .. case] = function()
+    local t = attach()
+    ready(t)
+    if case == "empty" then
+      state.snapshot.agents = {}
+    else
+      state.snapshot.agents[1].agent = vim.NIL
+      if case == "other-process-unknown" then
+        state.processes = { ["w1:p2"] = { group = 2147483647 } }
+      end
+    end
+    save(state)
+    Session.sessions()
+    expect.equality(t.closed, true)
+    expect.equality(Terminal.get(t.id), nil)
+    expect.equality(
+      vim.tbl_contains(warnings, function(message)
+        return message:find("no longer detected", 1, true) ~= nil
+      end, { predicate = true }),
+      true
+    )
+  end
+end
+
+for _, case in ipairs({ "process", "query", "malformed-list", "malformed-record" }) do
+  T["unknown discovery preserves client " .. case] = function()
+    local t = attach()
+    ready(t)
+    if case == "process" then
+      state.processes = { ["w1:p1"] = { group = 2147483647 } }
+    elseif case == "query" then
+      state.fail_snapshot = true
+    elseif case == "malformed-list" then
+      state.snapshot.agents = { invalid = "object instead of array" }
+    else
+      state.snapshot.agents[1].agent = vim.NIL
+      state.snapshot.agents[3] = { invalid = "missing identity" }
+    end
+    save(state)
+    Session.sessions()
+    expect.equality(t.closed, nil)
+    expect.equality(t:is_running(), true)
+    expect.equality(t.parent.agent_status, "unknown")
+  end
+end
+
+T["attached non-native process replacement closes old client"] = function()
+  for _, agent in ipairs(state.snapshot.agents) do
+    agent.name, agent.agent_session = nil, nil
+  end
+  local first = owned_job({ "python3", "-I", "-S", "-c", "import time; time.sleep(30)" }, { pty = true })
+  state.processes = { ["w1:p1"] = { group = vim.fn.jobpid(first) } }
+  save(state)
+  local t = attach()
+  ready(t)
+  local old_process = vim.deepcopy(t.parent.process_identity)
+  state.snapshot.agents[1].revision, state.snapshot.agents[1].state_change_seq = 2, 3
+  save(state)
+  Session.sessions()
+  expect.equality(t.closed, nil)
+  vim.fn.jobstop(first)
+  vim.fn.jobwait({ first }, 1000)
+  local second = owned_job({ "python3", "-I", "-S", "-c", "import time; time.sleep(30)" }, { pty = true })
+  state.processes["w1:p1"].group = vim.fn.jobpid(second)
+  save(state)
+  Session.sessions()
+  expect.equality(t.closed, true)
+  expect.equality(Terminal.get(t.id), nil)
+  expect.equality(t.parent.process_identity, old_process)
+  expect.equality(#warnings, 1)
+  expect.equality(warnings[1]:find("owner identity changed", 1, true) ~= nil, true)
+  local found = require("sidekick.cli.state").get({ started = true })
+  expect.equality(#vim.tbl_filter(function(item)
+    return item.session.id == t.source_id
+  end, found), 1)
+end
+
+T["picker formats named unnamed and plain sessions"] = function()
+  local Select = require("sidekick.cli.ui.select")
+  local State = require("sidekick.cli.state")
+  local function render(source)
+    source.backend, source.started = "herdr", true
+    return table.concat(vim.tbl_map(function(part)
+      return part[1]
+    end, Select.format(State.get_state(Session.new(source)))))
+  end
+  expect.equality(render(H.sessions()[1]):find("test-1", 1, true) ~= nil, true)
+  for _, agent in ipairs(state.snapshot.agents) do
+    agent.name = nil
+  end
+  save(state)
+  local discovered = H.sessions()
+  local first, second = render(discovered[1]), render(discovered[2])
+  expect.no_equality(first, second)
+  expect.equality(first:find("term-1 (idle)", 1, true) ~= nil, true)
+  expect.equality(second:find("term-2 (idle)", 1, true) ~= nil, true)
+  local plain = Terminal.new({ tool = "codex", cwd = root, started = true })
+  local label = table.concat(vim.tbl_map(function(part)
+    return part[1]
+  end, Select.format(State.get_state(plain))))
+  expect.equality(label:find("[terminal]", 1, true) ~= nil, true)
+end
+
+T["invalid manual attachment fails before resource registration"] = function()
+  expect.error(function()
+    Terminal.new({ tool = "codex", manual_input = true })
+  end)
+  expect.equality(Terminal.terminals, {})
+end
+
+T["configuration diagnostics distinguish shape and invalid name"] = function()
+  Config.cli.mux.herdr = false
+  expect.equality(H.sessions(), {})
+  expect.equality(H.last_error:find("must be a table", 1, true) ~= nil, true)
+  Config.cli.mux.herdr = { session = "invalid/name" }
+  expect.equality(H.sessions(), {})
+  expect.equality(H.last_error:find("letters, digits", 1, true) ~= nil, true)
+end
+
 return T

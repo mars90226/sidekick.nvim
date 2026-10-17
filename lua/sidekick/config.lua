@@ -87,13 +87,18 @@ local defaults = {
       -- Experimental herdr attachment: set backend = "herdr" and choose an existing
       -- running server below. Only existing agents are selectable; enabled does
       -- not permit creating agents or falling back to a new local tool.
-      -- Selecting herdr activates discovery regardless of mux.enabled; only existing
-      -- herdr agents are attachable, while other backends' existing sessions remain visible.
+      -- Selecting herdr activates discovery regardless of mux.enabled. The herdr
+      -- backend only attaches existing herdr agents. Other backends' sessions remain
+      -- visible and attachable, with their usual automatic-input behavior.
       -- Requires local Linux with the same /proc namespace, herdr on PATH, and
       -- identical client/server versions. Agent kinds must match configured tool names.
+      -- Requires a valid pane shell PID distinct from the agent foreground group;
+      -- agents launched as the pane root process are not supported.
       -- Conflicting clients fail without takeover/retry. Closing a client preserves
-      -- the agent; reselect explicitly after a disconnect. Automatic paste/submit
-      -- remains disabled; manual terminal input is available.
+      -- the agent; reselect explicitly after a disconnect. Only herdr attachments
+      -- disable automatic paste/submit; manual terminal input is available.
+      -- Discovery retires a changed or confirmed missing owner with a warning.
+      -- Failed discovery or unknown process evidence keeps the client with unknown status.
       -- Ownership is checked before attach/show and terminal ID + socket are pinned.
       -- These checks are not atomic: replacement after a check or while the window
       -- is already visible may receive manual input. No strict occupant binding is claimed.

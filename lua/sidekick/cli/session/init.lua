@@ -16,7 +16,8 @@ M._attached = {} ---@type table<string,sidekick.cli.Session>
 ---@field started? boolean
 ---@field external? boolean external sessions won't be opened in a terminal
 ---@field source_id? string Identity of an already-discovered source hidden by a live wrapper
----@field manual_input? boolean Disable automatic input; parent must implement validate()
+---@field manual_input? boolean Internal herdr attachment policy: parent.validate required; no restart/automatic input, validate before show, close on client exit, local launch cwd
+---@field validate? fun(self:sidekick.cli.Session):boolean, string?
 ---@field same_owner? fun(self:sidekick.cli.Session, other:sidekick.cli.Session):boolean
 ---@field parent? sidekick.cli.Session
 ---@field mux_session? string
@@ -74,6 +75,7 @@ end
 
 --- List all active sessions for this backend
 ---@return sidekick.cli.session.State[]
+---@return table<string,boolean>? observed_ids Optional authoritative presence map; nil leaves absence unknown.
 function B.sessions()
   error("Backend:sessions() not implemented")
 end
@@ -143,8 +145,11 @@ function M.sessions()
   M.setup()
   local ret = {} ---@type sidekick.cli.Session[]
   local ids = {} ---@type table<string,boolean>
+  local presence = {} ---@type table<string,table<string,boolean>>
   for name, backend in pairs(M.backends) do
-    for _, s in pairs(backend:sessions()) do
+    local discovered, observed = backend:sessions()
+    presence[name] = type(observed) == "table" and observed or nil
+    for _, s in pairs(discovered) do
       s.backend = name
       s.started = true
       ret[#ret + 1] = M.new(s)
@@ -162,12 +167,32 @@ function M.sessions()
   local active = {}
   for _, s in ipairs(ret) do
     local source = s.source_id and sources[s.source_id]
-    if source and s.parent and s.parent.same_owner then
-      if s.parent:same_owner(source) then
-        -- Refresh metadata only for the same owner, including its display cwd.
-        s.parent, s.cwd, s.sid = source, source.cwd, source.sid
+    if s.source_id and s.parent and s.parent.same_owner then
+      local reason
+      if source then
+        if s.parent:same_owner(source) then
+          -- Refresh metadata only for the same owner, including its display cwd.
+          s.parent, s.cwd, s.sid = source, source.cwd, source.sid
+        else
+          reason = "owner identity changed"
+        end
       else
-        s:close() -- The live client must not keep hiding a replacement occupant.
+        local observed = presence[s.mux_backend]
+        if observed and not observed[s.source_id] then
+          reason = "agent is no longer detected in the server snapshot"
+        else
+          s.parent.agent_status = "unknown" -- Discovery failure is not confirmed absence.
+        end
+      end
+      if reason then
+        s:close()
+        Util.warn(
+          "Herdr attachment `"
+            .. (s.parent.agent_name or s.tool.name)
+            .. "` closed: "
+            .. reason
+            .. "; select the existing agent again"
+        )
       end
     end
     if not s.closed then

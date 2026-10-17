@@ -1,6 +1,7 @@
 local Config = require("sidekick.config")
 local Util = require("sidekick.util")
 
+-- Experimental, existing agents only. No server creation or input API fallback.
 ---@class sidekick.cli.muxer.Herdr: sidekick.cli.Session
 ---@field endpoint {name:string, socket:string}
 ---@field binding {terminal:string, pane:string, kind:string, native?:table}
@@ -8,7 +9,6 @@ local Util = require("sidekick.util")
 ---@field agent_name? string
 ---@field agent_status? string
 
--- Experimental, existing agents only. No server creation or input API fallback.
 local M = { priority = 50, external = false, manual_input = true }
 M.__index = M
 
@@ -62,8 +62,13 @@ end
 
 function M.endpoint()
   local opts = Config.cli.mux.herdr
-  local name = type(opts) == "table" and opts.session
+  if type(opts) ~= "table" then
+    M._command_error = "cli.mux.herdr must be a table with an existing server session name"
+    return nil
+  end
+  local name = opts.session
   if not present(name) or not name:match("^[%w_-]+$") then
+    M._command_error = "cli.mux.herdr.session must contain only letters, digits, underscores or hyphens"
     return nil
   end
   local list = M.json({ "session", "list", "--json" })
@@ -112,7 +117,7 @@ function M.snapshot(endpoint)
   end
   local reply = M.json({ "api", "snapshot" }, endpoint.name)
   local snapshot = reply and type(reply.result) == "table" and reply.result.snapshot
-  if type(snapshot) ~= "table" or type(snapshot.agents) ~= "table" then
+  if type(snapshot) ~= "table" or type(snapshot.agents) ~= "table" or not vim.islist(snapshot.agents) then
     M._command_error = M._command_error or "server returned an invalid snapshot"
     return nil
   end
@@ -176,6 +181,8 @@ function M.process_identity(endpoint, pane)
   return { group = group, starttime = fields[20] }
 end
 
+---@return sidekick.cli.session.State[]
+---@return table<string,boolean>? observed_ids Configured agent IDs in a complete snapshot, including process-unknown records; nil means absence cannot be inferred.
 function M.sessions()
   M._command_error = nil
   local endpoint = M.endpoint()
@@ -187,13 +194,26 @@ function M.sessions()
     return fail(M._command_error or "server socket, snapshot or client/server version did not match")
   end
   local ret, tools, unavailable = {}, Config.tools(), false
-  for _, agent in ipairs(snapshot and snapshot.agents or {}) do
-    if type(agent) == "table" and tools[agent.agent] and present(agent.terminal_id) and present(agent.pane_id) then
+  local observed, complete = {}, true
+  local prefix = "herdr:" .. vim.fn.sha256(endpoint.socket) .. ":"
+  for _, agent in ipairs(snapshot.agents) do
+    if
+      type(agent) ~= "table"
+      or not present(agent.terminal_id)
+      or not present(agent.pane_id)
+      or (agent.agent ~= nil and agent.agent ~= vim.NIL and type(agent.agent) ~= "string")
+    then
+      complete, unavailable = false, true
+      M._command_error = "snapshot contains an agent record without a usable identity"
+    elseif tools[agent.agent] then
+      -- Presence is independent of process validation: an unknown process must
+      -- not be mistaken for a confirmed missing agent.
+      observed[prefix .. agent.terminal_id] = true
       local cwd = present(agent.foreground_cwd) and agent.foreground_cwd or agent.cwd
       local process = M.process_identity(endpoint, agent.pane_id)
       if present(cwd) and process then
         ret[#ret + 1] = {
-          id = "herdr:" .. vim.fn.sha256(endpoint.socket) .. ":" .. agent.terminal_id,
+          id = prefix .. agent.terminal_id,
           tool = tools[agent.agent],
           cwd = cwd,
           endpoint = endpoint,
@@ -213,10 +233,10 @@ function M.sessions()
       M._command_error
         or "some matching agents lack a cwd or a live non-shell foreground process in this Linux namespace"
     )
-    return ret
+    return ret, complete and observed or nil
   end
   M.last_error, M._warned = nil, nil
-  return ret
+  return ret, complete and observed or nil
 end
 
 function M:same_owner(other)
