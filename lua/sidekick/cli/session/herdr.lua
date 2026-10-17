@@ -163,7 +163,6 @@ function M.process_identity(endpoint, pane)
     or type(shell) ~= "number"
     or shell <= 0
     or shell % 1 ~= 0
-    or group == shell
   then
     return nil
   end
@@ -178,11 +177,14 @@ function M.process_identity(endpoint, pane)
   if not fields or not fields[20] or fields[1] == "Z" then
     return nil
   end
+  if group == shell then
+    return nil, "shell" -- Positive live shell evidence, not an unavailable process query.
+  end
   return { group = group, starttime = fields[20] }
 end
 
 ---@return sidekick.cli.session.State[]
----@return table<string,boolean>? observed_ids Configured agent IDs in a complete snapshot, including process-unknown records; nil means absence cannot be inferred.
+---@return table<string,boolean>? observed_ids Configured agent IDs in a complete snapshot: true includes process-unknown records, false confirms a foreground shell; nil means absence cannot be inferred.
 function M.sessions()
   M._command_error = nil
   local endpoint = M.endpoint()
@@ -210,7 +212,7 @@ function M.sessions()
       -- not be mistaken for a confirmed missing agent.
       observed[prefix .. agent.terminal_id] = true
       local cwd = present(agent.foreground_cwd) and agent.foreground_cwd or agent.cwd
-      local process = M.process_identity(endpoint, agent.pane_id)
+      local process, foreground = M.process_identity(endpoint, agent.pane_id)
       if present(cwd) and process then
         ret[#ret + 1] = {
           id = prefix .. agent.terminal_id,
@@ -223,6 +225,8 @@ function M.sessions()
           agent_status = present(agent.agent_status) and agent.agent_status or nil,
           mux_session = endpoint.name,
         }
+      elseif foreground == "shell" then
+        observed[prefix .. agent.terminal_id] = false
       else
         unavailable = true
       end

@@ -75,7 +75,7 @@ end
 
 --- List all active sessions for this backend
 ---@return sidekick.cli.session.State[]
----@return table<string,boolean>? observed_ids Optional authoritative presence map; nil leaves absence unknown.
+---@return table<string,boolean>? observed_ids Optional authoritative presence map; false confirms a foreground shell, nil leaves absence unknown.
 function B.sessions()
   error("Backend:sessions() not implemented")
 end
@@ -178,7 +178,9 @@ function M.sessions()
         end
       else
         local observed = presence[s.mux_backend]
-        if observed and not observed[s.source_id] then
+        if observed and observed[s.source_id] == false then
+          reason = "pane foreground returned to its shell"
+        elseif observed and not observed[s.source_id] then
           reason = "agent is no longer detected in the server snapshot"
         else
           s.parent.agent_status = "unknown" -- Discovery failure is not confirmed absence.

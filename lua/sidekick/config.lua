@@ -97,7 +97,8 @@ local defaults = {
       -- Conflicting clients fail without takeover/retry. Closing a client preserves
       -- the agent; reselect explicitly after a disconnect. Only herdr attachments
       -- disable automatic paste/submit; manual terminal input is available.
-      -- Discovery retires a changed or confirmed missing owner with a warning.
+      -- Discovery retires a changed or confirmed missing owner, or a confirmed
+      -- foreground shell, with a warning. Unknown process evidence is not a shell.
       -- Failed discovery or unknown process evidence keeps the client with unknown status.
       -- Ownership is checked before attach/show and terminal ID + socket are pinned.
       -- These checks are not atomic: replacement after a check or while the window

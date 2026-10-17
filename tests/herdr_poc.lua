@@ -16,10 +16,11 @@ local function attach(index)
   return Session.attach(Session.new(source))
 end
 local function ready(t)
+  -- Terminal rows can wrap the fixed fixture marker across multiple screen lines.
   expect.equality(
     vim.wait(2000, function()
       return t:buf_valid()
-        and table.concat(vim.api.nvim_buf_get_lines(t.buf, 0, -1, false), "\n"):find("MOCK ATTACHED", 1, true) ~= nil
+        and table.concat(vim.api.nvim_buf_get_lines(t.buf, 0, -1, false), ""):find("MOCK ATTACHED", 1, true) ~= nil
     end),
     true
   )
@@ -689,12 +690,14 @@ for _, case in ipairs({ "non-agent", "empty", "other-process-unknown" }) do
   end
 end
 
-for _, case in ipairs({ "process", "query", "malformed-list", "malformed-record" }) do
+for _, case in ipairs({ "process", "query", "malformed-list", "malformed-record", "unreadable-shell" }) do
   T["unknown discovery preserves client " .. case] = function()
     local t = attach()
     ready(t)
     if case == "process" then
       state.processes = { ["w1:p1"] = { group = 2147483647 } }
+    elseif case == "unreadable-shell" then
+      state.processes = { ["w1:p1"] = { group = 2147483647, shell_pid = 2147483647 } }
     elseif case == "query" then
       state.fail_snapshot = true
     elseif case == "malformed-list" then
@@ -782,6 +785,54 @@ T["configuration diagnostics distinguish shape and invalid name"] = function()
   Config.cli.mux.herdr = { session = "invalid/name" }
   expect.equality(H.sessions(), {})
   expect.equality(H.last_error:find("letters, digits", 1, true) ~= nil, true)
+end
+
+T["live foreground shell retires stale agent wrapper"] = function()
+  local t = attach()
+  ready(t)
+  state.processes = { ["w1:p1"] = { group = vim.fn.getpid(), shell_pid = vim.fn.getpid() } }
+  save(state)
+  local process, foreground = H.process_identity(t.parent.endpoint, "w1:p1")
+  expect.equality(process, nil)
+  expect.equality(foreground, "shell")
+  Session.sessions()
+  expect.equality(t.closed, true)
+  expect.equality(Terminal.get(t.id), nil)
+  expect.equality(warnings[#warnings]:find("returned to its shell", 1, true) ~= nil, true)
+end
+
+T["unknown process recovers to same agent without replacing client"] = function()
+  local t = attach()
+  ready(t)
+  local job = t.job
+  state.processes = { ["w1:p1"] = { group = 2147483647 } }
+  save(state)
+  Session.sessions()
+  expect.equality(t.closed, nil)
+  expect.equality(t.parent.agent_status, "unknown")
+  state.processes = nil
+  state.snapshot.agents[1].agent_status = "working"
+  save(state)
+  Session.sessions()
+  expect.equality(t.closed, nil)
+  expect.equality(t.job, job)
+  expect.equality(t.parent.agent_status, "working")
+end
+
+T["shell and unknown transitions reconcile independently"] = function()
+  local first, second = attach(1), attach(2)
+  ready(first)
+  ready(second)
+  state.processes = {
+    ["w1:p1"] = { group = vim.fn.getpid(), shell_pid = vim.fn.getpid() },
+    ["w1:p2"] = { group = 2147483647 },
+  }
+  save(state)
+  Session.sessions()
+  expect.equality(first.closed, true)
+  expect.equality(second.closed, nil)
+  expect.equality(second:is_running(), true)
+  expect.equality(second.parent.agent_status, "unknown")
 end
 
 return T
