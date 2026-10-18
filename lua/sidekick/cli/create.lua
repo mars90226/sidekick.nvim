@@ -731,10 +731,7 @@ function M.new(opts)
         )
         source = Session.new({ tool = op.tool, cwd = op.cwd, backend = op.backend })
         session = Session.attach(source)
-        assert(
-          not session.closed and (session.backend ~= "terminal" or session:is_running()),
-          "Failed to start local CLI tool '" .. op.tool .. "'"
-        )
+        assert(not session.closed and session:is_running(), "Failed to start local CLI tool '" .. op.tool .. "'")
         if session.show then
           session:show()
         end

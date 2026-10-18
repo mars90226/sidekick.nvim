@@ -181,6 +181,10 @@ getmetatable(T).opts.hooks = {
       jobpid = vim.fn.jobpid,
       jobstop = vim.fn.jobstop,
       watch = Config.cli.watch,
+      exec = Util.exec,
+      info = Util.info,
+      get_proc = vim.api.nvim_get_proc,
+      tmux = vim.env.TMUX,
       select = vim.ui.select,
       attach = Session.attach,
       backends = Session.backends,
@@ -282,6 +286,8 @@ getmetatable(T).opts.hooks = {
     vim.fn.jobstart, vim.fn.jobwait, vim.fn.jobpid, vim.fn.jobstop =
       original.jobstart, original.jobwait, original.jobpid, original.jobstop
     Config.cli.watch = original.watch
+    Util.exec, Util.info, vim.api.nvim_get_proc, vim.env.TMUX =
+      original.exec, original.info, original.get_proc, original.tmux
     Config.cli.primary_backend, Config.cli.discovery, Config.cli.mux, Config.cli.tools =
       original.primary, original.discovery, original.mux, original.tools
     Session.backends, Session.did_setup, Session._attached = original.backends, original.setup, original.attached
@@ -1314,6 +1320,9 @@ T["fresh non-herdr New uses explicit primary and releases its reservation"] = fu
       show = function()
         shown = true
       end,
+      is_running = function()
+        return true
+      end,
     }
   end
   local op = Create.new({
@@ -1656,6 +1665,76 @@ for _, doubled in ipairs({ false, true }) do
     local op = wait(Create.new({ name = "codex" }))
     expect.equality(op.phase, doubled and "unknown" or "attached")
     expect.equality(count("agent", "start"), doubled and 0 or 1)
+  end
+end
+
+for _, mode in ipairs({ "window", "split" }) do
+  for _, failure in ipairs({ "command-failed", "no-pane", "malformed-pane", "dead-pane" }) do
+    T["external tmux creation verifies liveness and permits retry: " .. mode .. "/" .. failure] = function()
+      local Tmux = require("sidekick.cli.session.tmux")
+      Session.register("tmux", Tmux)
+      Config.cli.primary_backend, Config.cli.mux.create = "tmux", mode
+      vim.env.TMUX = "fixture-only"
+      local succeed, attempts, completed = false, 0, 0
+      local sources = {}
+      Session.attach = function(source)
+        sources[#sources + 1] = source
+        return original.attach(source)
+      end
+      Util.info = function() end
+      Util.exec = function(cmd)
+        attempts = attempts + 1
+        expect.equality(cmd[1], "tmux")
+        expect.equality(cmd[2], mode == "window" and "new-window" or "split-window")
+        if not succeed then
+          if failure == "command-failed" then
+            return nil
+          end
+          if failure == "no-pane" then
+            return {}
+          end
+          if failure == "malformed-pane" then
+            return { "not a pane" }
+          end
+        end
+        return { "$7:%9:1234567:fixture:" .. root }
+      end
+      vim.api.nvim_get_proc = function(pid)
+        if pid == 1234567 then
+          return (succeed or failure ~= "dead-pane") and { pid = pid } or nil
+        end
+        return original.get_proc(pid)
+      end
+      local buffers, windows = #vim.api.nvim_list_bufs(), #vim.api.nvim_list_wins()
+      local function done()
+        completed = completed + 1
+      end
+      local failed = Create.new({ name = "codex", focus = false, on_done = done })
+      expect.equality(failed.phase, "failed")
+      expect.equality(failed.error:find("Failed to start", 1, true) ~= nil, true)
+      expect.equality(sources[1].started == true, failure == "dead-pane")
+      expect.equality(Session._attached, {})
+      expect.equality(Terminal.terminals, {})
+      expect.equality(Create.pending[failed.key], nil)
+      expect.equality(attempts, 1)
+      expect.equality(completed, 1)
+      expect.equality(#vim.api.nvim_list_bufs(), buffers)
+      expect.equality(#vim.api.nvim_list_wins(), windows)
+      succeed = true
+      local ready = Create.new({ name = "codex", focus = false, on_done = done })
+      expect.equality(ready.phase, "attached")
+      expect.equality(ready.session, sources[2])
+      expect.equality(ready.session.started, true)
+      expect.equality(ready.session:is_running(), true)
+      expect.equality(Session._attached[ready.session.id], ready.session)
+      expect.equality(Create.pending[ready.key], nil)
+      expect.equality(attempts, 2)
+      expect.equality(completed, 2)
+      Session.detach(ready.session)
+      expect.equality(Session._attached, {})
+      expect.equality(#vim.api.nvim_list_bufs(), buffers)
+      expect.equality(#vim.api.nvim_list_wins(), windows)
+    end
   end
 end
 
