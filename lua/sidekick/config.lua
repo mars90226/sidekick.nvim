@@ -107,7 +107,7 @@ local defaults = {
       -- CLI calls (up to 1.5s each), may repeat per action, and can block the UI.
       ---@class sidekick.cli.Herdr
       herdr = {
-        -- Existing running herdr server name, matching letters/digits/_/-.
+        -- Existing running herdr server name: 1-64 ASCII letters/digits/./_/-. "." and ".." are reserved.
         session = "default", ---@type string
       },
       backend = vim.env.ZELLIJ and "zellij" or "tmux", -- default to tmux unless zellij is detected

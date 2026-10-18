@@ -32,7 +32,7 @@ def reply(value):
 
 
 if scoped:
-    if len(args) < 3 or args[1] != "poc":
+    if len(args) < 3 or args[1] != state.get("session_name", "poc"):
         forbidden("wrong server")
     args = args[2:]
 if args == ["--version"] and not scoped:

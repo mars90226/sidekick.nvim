@@ -67,8 +67,9 @@ function M.endpoint()
     return nil
   end
   local name = opts.session
-  if not present(name) or not name:match("^[%w_-]+$") then
-    M._command_error = "cli.mux.herdr.session must contain only letters, digits, underscores or hyphens"
+  if not present(name) or #name > 64 or name == "." or name == ".." or not name:match("^[A-Za-z0-9._-]+$") then
+    M._command_error =
+      "cli.mux.herdr.session must be 1-64 ASCII letters, digits, dots, underscores or hyphens (not . or ..)"
     return nil
   end
   local list = M.json({ "session", "list", "--json" })
