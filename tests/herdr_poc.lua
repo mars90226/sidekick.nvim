@@ -119,7 +119,10 @@ getmetatable(T).opts.hooks = {
     for _, argv in ipairs(history) do
       local global_read = vim.deep_equal(argv, { "--version" }) or vim.deep_equal(argv, { "session", "list", "--json" })
       local pinned_attach = #argv == 3 and argv[1] == "terminal" and argv[2] == "attach"
-      expect.equality(global_read or pinned_attach or (argv[1] == "--session" and argv[2] == "poc"), true)
+      expect.equality(
+        global_read or pinned_attach or (argv[1] == "--session" and argv[2] == (state.session_name or "poc")),
+        true
+      )
       expect.equality(vim.tbl_contains(argv, "--takeover"), false)
     end
     vim.fn.writefile(vim.tbl_map(vim.json.encode, history), root .. "/all-calls", "a")
@@ -833,6 +836,41 @@ T["shell and unknown transitions reconcile independently"] = function()
   expect.equality(second.closed, nil)
   expect.equality(second:is_running(), true)
   expect.equality(second.parent.agent_status, "unknown")
+end
+
+-- Matches herdr v0.9.5 src/session.rs validate_name, including reserved names.
+for _, name in ipairs({ "client.dev", "a.b_c-9", string.rep("a", 64), "default" }) do
+  T["supported named server " .. name] = function()
+    vim.fn.writefile({}, root .. "/calls")
+    state.session_name, state.sessions[1].name = name, name
+    Config.cli.mux.herdr.session = name
+    save(state)
+    local found = H.sessions()
+    expect.equality(#found, 2)
+    expect.equality(found[1].endpoint.name, name)
+    expect.equality(found[1].endpoint.socket, state.socket)
+  end
+end
+
+for _, name in ipairs({
+  ".",
+  "..",
+  "../wrong",
+  "a/b",
+  "a" .. string.char(92) .. "b",
+  "a b",
+  "x;echo nope",
+  "x" .. string.char(10) .. "x",
+  string.char(195, 169),
+  string.rep("a", 65),
+}) do
+  T["unsupported server name is rejected before CLI: " .. vim.inspect(name)] = function()
+    Config.cli.mux.herdr.session = name
+    local before = #calls()
+    expect.equality(H.endpoint(), nil)
+    expect.equality(#calls(), before)
+    expect.equality(H._command_error:find("1-64 ASCII", 1, true) ~= nil, true)
+  end
 end
 
 return T
