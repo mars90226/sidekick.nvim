@@ -33,11 +33,11 @@ local defaults = {
   -- Work with AI cli tools directly from within Neovim
   cli = {
     watch = true, -- notify Neovim of file changes done by AI CLI tools
-    -- Primary backend for explicit `require("sidekick.cli").new()` requests.
+    -- Primary backend for the selector New action, :Sidekick cli new, and cli.new().
     -- nil preserves the existing mux.enabled/backend behavior. Existing sessions
     -- always use their own source backend, regardless of this setting.
-    -- A herdr primary or legacy mux backend hides not-started rows, so these
-    -- actions cannot implicitly create a tool or fall back to a local process.
+    -- Implicit starts retain mux.enabled/backend behavior. A legacy herdr mux
+    -- backend hides not-started rows to prevent implicit creation or local fallback.
     primary_backend = nil, ---@type "terminal"|"tmux"|"zellij"|"herdr"?
     -- Optional discovery overrides, independent of the primary backend.
     -- Unset providers retain their defaults; terminal wrappers are always tracked.
@@ -97,7 +97,8 @@ local defaults = {
       -- Experimental herdr support: choose an existing running server below.
       -- Set primary_backend = "herdr" for explicit New requests and discovery.herdr
       -- = true to discover it with another primary. Creation also requires the
-      -- separate create.enabled opt-in; select/send never create a herdr agent.
+      -- separate create.enabled opt-in. Only the explicit New action creates herdr agents;
+      -- existing session rows attach, and New never forwards a pending send payload.
       -- Legacy mux.backend = "herdr" activates discovery regardless of mux.enabled.
       -- Other backends' sessions remain
       -- visible and attachable, with their usual automatic-input behavior.

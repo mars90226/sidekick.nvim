@@ -69,9 +69,10 @@ end
 
 --- Open a CLI using the primary backend, after confirmation.
 --- Herdr creates a dedicated workspace. tmux/zellij may reuse an existing mux
---- session with the same tool/cwd name. Sessions registered under this tool/cwd's
---- Sidekick id are refused; discovered panes can have different ids.
---- send/select never call this action. Returned operations have id/phase/journal.
+--- session with the same tool/cwd name. Non-herdr requests refuse sessions registered
+--- under this tool/cwd's Sidekick id; discovered panes can have different ids.
+--- Select offers an explicit New action; choosing an existing session row only attaches.
+--- New never submits a pending send payload. Returned operations have id/phase/journal.
 --- on_done runs once for a newly planned operation. Dismissed tool pickers,
 --- raised validation errors and deduplicated calls do not invoke a new callback.
 ---@param opts? {name?:string, cwd?:string, focus?:boolean, on_done?:fun(op:table)}
@@ -124,6 +125,7 @@ function M.toggle(opts)
     end
   end, {
     attach = true,
+    new_focus = opts.focus,
     filter = opts.filter,
   })
 end
@@ -145,7 +147,8 @@ function M.focus(opts)
   end, {
     attach = true,
     filter = opts.filter,
-    focus = false,
+    focus = false, -- The callback handles existing-session focus.
+    new_focus = true,
     show = true,
   })
 end
@@ -212,6 +215,7 @@ function M.send(opts)
     end)
   end, {
     attach = true,
+    pending_send = true,
     filter = opts.filter,
     focus = opts.focus,
     show = true,

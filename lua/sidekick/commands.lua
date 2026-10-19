@@ -32,6 +32,9 @@ M.commands = {
     end,
   },
   cli = {
+    new = function(opts)
+      require("sidekick.cli").new(opts)
+    end,
     show = function(opts)
       require("sidekick.cli").show(opts)
     end,
@@ -129,6 +132,23 @@ end
 ---@param line string
 function M.complete(line)
   line = line:gsub("^%s*Sidekick%s+", "")
+  local args = line:match("^cli%s+new%s+(.*)$")
+  if args then
+    local prefix = args:match("(%S*)$") or ""
+    local choices = { "cwd=", "focus=false" }
+    local Config = require("sidekick.config")
+    local primary = Config.cli.primary_backend
+      or ((Config.cli.mux.enabled or Config.cli.mux.backend == "herdr") and Config.cli.mux.backend or "terminal")
+    for name in pairs(Config.cli.tools) do
+      if primary ~= "herdr" or name == "claude" or name == "codex" then
+        choices[#choices + 1] = "name=" .. name
+      end
+    end
+    table.sort(choices)
+    return vim.tbl_filter(function(choice)
+      return choice:sub(1, #prefix) == prefix
+    end, choices)
+  end
   local cmd = M.parse(line, { error = false })
   return type(cmd) == "table" and cmd or {}
 end

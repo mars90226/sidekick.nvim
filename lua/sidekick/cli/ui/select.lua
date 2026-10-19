@@ -2,18 +2,39 @@ local Config = require("sidekick.config")
 local Util = require("sidekick.util")
 
 ---@class sidekick.cli.Select: sidekick.cli.With
----@field cb fun(state?:sidekick.cli.State)
+---@field cb fun(state?:sidekick.cli.State) Receives nil on dismissal or explicit New.
 ---@field auto? boolean Automatically select if only one tool matches the filter
+---@field new? boolean Include an explicit New action (default true).
+
+---@class sidekick.cli.NewItem
+---@field new true
+---@field backend string
+---@field cwd string
+---@field name? string
 
 local M = {}
 
 ---@param opts sidekick.cli.Select
 function M.select(opts)
   assert(type(opts) == "table", "opts must be a table")
+  local Session = require("sidekick.cli.session")
+  local cwd = Session.cwd() -- Pin cwd before either asynchronous picker opens.
+  ---@type (sidekick.cli.State|sidekick.cli.NewItem)[]
   local tools = require("sidekick.cli.state").get(opts.filter)
 
-  ---@param state? sidekick.cli.State
+  ---@param state? sidekick.cli.State|sidekick.cli.NewItem
   local on_select = function(state)
+    if state and state.new then
+      if opts.pending_send then
+        Util.warn("New cancels this send; the pending text was not sent. Re-enter it after attaching.")
+      end
+      opts.cb(nil) -- Cancel the original attach/send action; New never submits its payload.
+      local ok, err = pcall(require("sidekick.cli").new, { name = state.name, cwd = state.cwd, focus = opts.focus })
+      if not ok then
+        Util.error(tostring(err))
+      end
+      return
+    end
     if state and not state.installed then
       M.on_missing(state.tool)
       state = nil
@@ -21,11 +42,23 @@ function M.select(opts)
     opts.cb(state)
   end
 
+  -- Preserve automatic attachment to a sole matching source. New is never automatic.
+  if #tools == 1 and opts.auto then
+    on_select(tools[1])
+    return
+  end
+  local filter = opts.filter or {}
+  if
+    opts.new ~= false
+    and not filter.attached
+    and not filter.started
+    and not filter.session
+    and not filter.terminal
+  then
+    tools[#tools + 1] = { new = true, backend = Session.primary(), cwd = cwd, name = filter.name }
+  end
   if #tools == 0 then
     Util.warn("No tools match the given filter")
-    return
-  elseif #tools == 1 and opts.auto then
-    on_select(tools[1])
     return
   end
 
@@ -33,7 +66,7 @@ function M.select(opts)
   local select_opts = {
     prompt = "Select CLI tool:",
     kind = "sidekick_cli",
-    ---@param tool sidekick.cli.State
+    ---@param tool sidekick.cli.State|sidekick.cli.NewItem
     format_item = function(tool)
       local parts = M.format(tool)
       return table.concat(vim.tbl_map(function(p)
@@ -59,9 +92,12 @@ function M.on_missing(tool)
   end
 end
 
----@param state sidekick.cli.State|snacks.picker.Item
+---@param state sidekick.cli.State|sidekick.cli.NewItem|snacks.picker.Item
 ---@param picker? snacks.Picker
 function M.format(state, picker)
+  if state.new then
+    return { { "New " .. (state.name or "agent") .. " via " .. state.backend .. " in " .. state.cwd, "Special" } }
+  end
   local sw = vim.api.nvim_strwidth
   local ret = {} ---@type snacks.picker.Highlight[]
 
