@@ -144,6 +144,21 @@ describe("commands", function()
         expected = { "select", "show", "send" },
       },
       {
+        name = "suggests New command",
+        input = "Sidekick cli n",
+        expected = { "new" },
+      },
+      {
+        name = "suggests New tool argument",
+        input = "Sidekick cli new name=cod",
+        expected = { "name=codex" },
+      },
+      {
+        name = "suggests New cwd argument",
+        input = "Sidekick cli new cwd",
+        expected = { "cwd=" },
+      },
+      {
         name = "returns empty when no matches",
         input = "Sidekick unknown",
         expected = {},

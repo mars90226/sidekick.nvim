@@ -71,7 +71,8 @@ end
 --- Herdr creates a dedicated workspace. tmux/zellij may reuse an existing mux
 --- session with the same tool/cwd name. Sessions registered under this tool/cwd's
 --- Sidekick id are refused; discovered panes can have different ids.
---- send/select never call this action. Returned operations have id/phase/journal.
+--- Select offers an explicit New action; choosing an existing session row only attaches.
+--- New never submits a pending send payload. Returned operations have id/phase/journal.
 --- on_done runs once for a newly planned operation. Dismissed tool pickers,
 --- raised validation errors and deduplicated calls do not invoke a new callback.
 ---@param opts? {name?:string, cwd?:string, focus?:boolean, on_done?:fun(op:table)}
@@ -212,6 +213,7 @@ function M.send(opts)
     end)
   end, {
     attach = true,
+    pending_send = true,
     filter = opts.filter,
     focus = opts.focus,
     show = true,

@@ -3,7 +3,7 @@ local Herdr = require("sidekick.cli.session.herdr")
 local Session = require("sidekick.cli.session")
 local Util = require("sidekick.util")
 
--- Explicit creation only. Discovery, send and terminal restart never enter here.
+-- Explicit creation only, including New chosen during send; no automatic creation or terminal restart.
 local M = { operations = {}, pending = {}, generation = 0 }
 local sequence = 0
 local shells = { bash = true, zsh = true, sh = true, dash = true }
@@ -686,7 +686,10 @@ function M.new(opts)
     table.sort(names)
     vim.ui.select(names, { prompt = "New agent: choose tool" }, function(name)
       if name then
-        M.new(vim.tbl_extend("force", opts, { name = name, cwd = cwd }))
+        local ok, err = pcall(M.new, vim.tbl_extend("force", opts, { name = name, cwd = cwd }))
+        if not ok then
+          Util.error(tostring(err))
+        end
       end
     end)
     return

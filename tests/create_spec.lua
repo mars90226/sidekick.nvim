@@ -565,7 +565,12 @@ end
 T["mixed discovery preserves each existing source backend"] = function()
   Session.backends = {}
   for _, backend in ipairs({ "tmux", "herdr" }) do
-    local provider = { __index = nil }
+    local provider = {
+      priority = 50,
+      is_attached = function()
+        return false
+      end,
+    }
     provider.__index = provider
     function provider.sessions()
       return { { id = backend .. "-source", cwd = root, tool = "codex" } }
@@ -579,6 +584,18 @@ T["mixed discovery preserves each existing source backend"] = function()
     sources[source.id] = source.backend
   end
   expect.equality(sources, { ["tmux-source"] = "tmux", ["herdr-source"] = "herdr" })
+  local State = require("sidekick.cli.state")
+  local rows = State.get({ started = true })
+  expect.equality(#rows, 2) -- Same tool and cwd must not collapse distinct providers.
+  local routed = {}
+  Session.attach = function(source)
+    routed[source.id] = source.backend
+    return source
+  end
+  for _, row in ipairs(rows) do
+    State.attach(row, { show = false })
+  end
+  expect.equality(routed, sources)
 end
 
 T["real tmux discovery and attach command remain independent of herdr primary"] = function()
@@ -1125,19 +1142,55 @@ T["begin does not reuse stale discovery diagnostics"] = function()
   expect.equality(count("workspace", "create"), 0)
 end
 
-T["herdr primary offers no implicit creation through select toggle or send"] = function()
-  Config.cli.mux.backend, Config.cli.mux.enabled = "tmux", false
-  local State, Cli = require("sidekick.cli.state"), require("sidekick.cli")
-  expect.equality(State.get(), {})
-  Cli.select({ filter = { name = "codex" } })
-  Cli.toggle({ name = "codex" })
-  Cli.send({ msg = "fixture text must not be sent", name = "codex" })
-  vim.wait(30, function()
-    return false
-  end)
-  expect.equality(count("workspace", "create"), 0)
-  expect.equality(count("agent", "start"), 0)
-  expect.equality(Create.operations, {})
+for _, case in ipairs({
+  { "herdr", "tmux", true, "tmux" },
+  { "herdr", "tmux", false, "terminal" },
+  { "herdr", "zellij", true, "zellij" },
+  { "herdr", "herdr", false, nil },
+  { "terminal", "herdr", true, nil },
+  { "tmux", "tmux", true, "tmux" },
+  { false, "tmux", true, "tmux" },
+  { false, "tmux", false, "terminal" },
+}) do
+  T["implicit rows and attach retain legacy mux policy: " .. vim.inspect(case)] = function()
+    local State = require("sidekick.cli.state")
+    Config.cli.primary_backend = case[1] or nil
+    Config.cli.mux.backend, Config.cli.mux.enabled = case[2], case[3]
+    Config.cli.discovery = { herdr = true, tmux = true, zellij = true }
+    Session.backends = {}
+    for _, backend in ipairs({ "terminal", "tmux", "zellij", "herdr" }) do
+      local provider = {
+        sessions = function()
+          return {}
+        end,
+      }
+      provider.__index = provider
+      Session.register(backend, provider)
+    end
+    local rows = State.get({ name = "codex" })
+    expect.equality(#rows, case[4] and 1 or 0)
+    if case[4] then
+      expect.equality(rows[1].session, nil)
+      local used
+      Session.attach = function(source)
+        used = source.backend
+        return source
+      end
+      State.attach(rows[1], { show = false })
+      expect.equality(used, case[4])
+    end
+    expect.equality(Create.operations, {})
+    expect.equality(calls, {})
+  end
+end
+
+T["herdr New retains primary while implicit tools retain enabled tmux"] = function()
+  Config.cli.mux.backend, Config.cli.mux.enabled = "tmux", true
+  local op = wait(Create.new({ name = "codex" }))
+  expect.equality(op.phase, "attached")
+  expect.equality(attached[1].backend, "herdr")
+  expect.equality(count("workspace", "create"), 1)
+  expect.equality(count("agent", "start"), 1)
 end
 
 for _, case in ipairs({ "claude-effort", "codex-effort", "dangling", "option-value", "env-key", "other-tool" }) do
@@ -1735,6 +1788,236 @@ for _, mode in ipairs({ "window", "split" }) do
       expect.equality(#vim.api.nvim_list_bufs(), buffers)
       expect.equality(#vim.api.nvim_list_wins(), windows)
     end
+  end
+end
+
+local function selector()
+  local pickers = {}
+  vim.ui.select = function(items, opts, cb)
+    pickers[#pickers + 1] = { items = items, opts = opts, cb = cb }
+  end
+  return pickers
+end
+
+T["selector New confirms herdr even with legacy tmux and an existing same-cwd source"] = function()
+  Config.cli.mux.backend, Config.cli.mux.enabled = "tmux", true
+  local provider = {
+    priority = 50,
+    is_attached = function()
+      return false
+    end,
+  }
+  provider.__index = provider
+  provider.sessions = function()
+    return { { id = "existing-tmux", tool = "codex", cwd = root } }
+  end
+  Session.register("tmux", provider)
+  local pickers, callbacks = selector(), {}
+  require("sidekick.cli").select({
+    filter = { name = "codex" },
+    cb = function(value)
+      callbacks[#callbacks + 1] = value or false
+    end,
+  })
+  local items = pickers[1].items
+  expect.equality(items[1].session.backend, "tmux")
+  local action = items[#items]
+  expect.equality(action.new, true)
+  expect.equality(action.cwd, root)
+  expect.equality(require("sidekick.cli.ui.select").format(action)[1][1]:find("via herdr", 1, true) ~= nil, true)
+  pickers[1].cb(action)
+  local op = pickers[2].items[1]
+  expect.equality(op.phase, "confirming")
+  expect.equality(count("workspace", "create"), 0)
+  pickers[1].cb(action) -- Duplicate selection reuses the reserved operation, not another dispatch.
+  expect.equality(#pickers, 2)
+  pickers[2].cb(op)
+  wait(op)
+  expect.equality(op.phase, "attached")
+  expect.equality(count("workspace", "create"), 1)
+  expect.equality(count("agent", "start"), 1)
+  expect.equality(callbacks, { false, false }) -- Pending attach/send payload never reaches the new agent.
+end
+
+T["selector New pins cwd and cancellation leaves each cwd independently available"] = function()
+  local pickers = selector()
+  require("sidekick.cli").select({ filter = { name = "codex" } })
+  local action = pickers[1].items[#pickers[1].items]
+  vim.fn.mkdir(root .. "/other", "p")
+  vim.fn.chdir(root .. "/other")
+  pickers[1].cb(action)
+  local first = pickers[2].items[1]
+  expect.equality(first.cwd, root)
+  require("sidekick.cli").select({ filter = { name = "codex" } })
+  pickers[3].cb(pickers[3].items[#pickers[3].items])
+  local second = pickers[4].items[1]
+  expect.equality(second.cwd, root .. "/other")
+  expect.equality(first.key ~= second.key, true)
+  pickers[2].cb(nil)
+  pickers[4].cb(nil)
+  expect.equality(first.phase, "cancelled")
+  expect.equality(second.phase, "cancelled")
+  expect.equality(Create.pending[first.key], nil)
+  expect.equality(Create.pending[second.key], nil)
+  expect.equality(count("workspace", "create"), 0)
+end
+
+T["selector dismissal and disabled New never dispatch and report validation"] = function()
+  Config.cli.mux.herdr.create.enabled = false
+  local pickers = selector()
+  require("sidekick.cli").select({ filter = { name = "codex" } })
+  pickers[1].cb(nil)
+  expect.equality(Create.operations, {})
+  pickers[1].cb(pickers[1].items[#pickers[1].items])
+  expect.equality(Create.operations, {})
+  expect.equality(table.concat(notices):find("Herdr creation is disabled", 1, true) ~= nil, true)
+  expect.equality(count("workspace", "create"), 0)
+end
+
+T["selector New startup failure is retained without retry or legacy fallback"] = function()
+  state.start_error, state.agent_missing = true, true
+  local pickers = selector()
+  require("sidekick.cli").select({ filter = { name = "codex" } })
+  local action = pickers[1].items[#pickers[1].items]
+  pickers[1].cb(action)
+  local op = pickers[2].items[1]
+  pickers[2].cb(op)
+  wait(op)
+  expect.equality(vim.tbl_contains({ "failed", "unknown", "blocked" }, op.phase), true)
+  pickers[1].cb(action)
+  expect.equality(#pickers, 2)
+  expect.equality(count("workspace", "create"), 1)
+  expect.equality(count("agent", "start"), 1)
+end
+
+T["New command forwards cwd and reaches the existing confirmation flow"] = function()
+  local pickers = selector()
+  local requested_cwd = root .. "/other project"
+  vim.fn.mkdir(requested_cwd, "p")
+  require("sidekick.commands").cmd({
+    args = "cli new name=codex cwd=" .. string.format("%q", requested_cwd) .. " focus=false",
+  })
+  local op = pickers[1].items[1]
+  expect.equality(op.backend, "herdr")
+  expect.equality(op.cwd, requested_cwd)
+  expect.equality(op.focus, false)
+  pickers[1].cb(nil)
+  expect.equality(op.phase, "cancelled")
+  expect.equality(count("workspace", "create"), 0)
+end
+
+T["selector existing mixed sources attach their own backend and never create"] = function()
+  Session.backends = {}
+  for _, backend in ipairs({ "tmux", "herdr" }) do
+    local provider = {
+      priority = 50,
+      is_attached = function()
+        return false
+      end,
+    }
+    provider.__index = provider
+    provider.sessions = function()
+      return { { id = backend .. "-source", tool = "codex", cwd = root } }
+    end
+    Session.register(backend, provider)
+  end
+  local used = {}
+  Session.attach = function(source)
+    used[#used + 1] = source.backend
+    return source
+  end
+  local pickers = selector()
+  require("sidekick.cli").select({ filter = { name = "codex" } })
+  for _, item in ipairs(pickers[1].items) do
+    if not item.new then
+      pickers[1].cb(item)
+    end
+  end
+  table.sort(used)
+  expect.equality(used, { "herdr", "tmux" })
+  expect.equality(Create.operations, {})
+  expect.equality(calls, {})
+end
+
+T["selector sole New is never automatic and attached-only lists omit New"] = function()
+  Config.cli.mux.backend = "herdr" -- No legacy placeholder, no discovered sources.
+  local pickers = selector()
+  require("sidekick.cli.ui.select").select({ auto = true, cb = function() end })
+  expect.equality(#pickers[1].items, 1)
+  expect.equality(pickers[1].items[1].new, true)
+  expect.equality(Create.operations, {})
+  require("sidekick.cli.ui.select").select({ filter = { attached = true }, cb = function() end })
+  expect.equality(#pickers, 1)
+end
+
+T["unfiltered New reports opt-in errors after canonical tool selection"] = function()
+  Config.cli.mux.herdr.create.enabled = false
+  Config.cli.tools.codex_new = { cmd = { "codex" } }
+  local pickers = selector()
+  require("sidekick.cli").select()
+  pickers[1].cb(pickers[1].items[#pickers[1].items])
+  expect.equality(pickers[2].items, { "claude", "codex" })
+  pickers[2].cb("codex")
+  expect.equality(table.concat(notices):find("Herdr creation is disabled", 1, true) ~= nil, true)
+  expect.equality(Create.operations, {})
+  local completions = require("sidekick.commands").complete("Sidekick cli new name=")
+  expect.equality(completions, { "name=claude", "name=codex" })
+end
+
+T["sole legacy tool still auto-attaches without offering or dispatching New"] = function()
+  local provider = {
+    sessions = function()
+      return {}
+    end,
+  }
+  provider.__index = provider
+  Session.backends = {}
+  Session.register("tmux", provider)
+  Config.cli.mux.backend, Config.cli.mux.enabled = "tmux", true
+  local used
+  Session.attach = function(source)
+    used = source.backend
+    return source
+  end
+  local pickers = selector()
+  require("sidekick.cli.ui.select").select({
+    auto = true,
+    filter = { name = "codex" },
+    cb = function(row)
+      require("sidekick.cli.state").attach(row, { show = false })
+    end,
+  })
+  expect.equality(used, "tmux")
+  expect.equality(#pickers, 0)
+  expect.equality(Create.operations, {})
+  expect.equality(calls, {})
+end
+
+for _, enabled in ipairs({ false, true }) do
+  T["send choosing New reports cancelled payload without sending: " .. tostring(enabled)] = function()
+    Config.cli.mux.backend = "herdr" -- No legacy placeholders: the only picker item is explicit New.
+    Config.cli.mux.herdr.create.enabled = enabled
+    local pickers = selector()
+    require("sidekick.cli").send({ name = "codex", text = { { "pending fixture message" } } })
+    expect.equality(
+      vim.wait(1000, function()
+        return #pickers == 1
+      end),
+      true
+    )
+    expect.equality(pickers[1].items[1].new, true)
+    pickers[1].cb(pickers[1].items[1])
+    expect.equality(table.concat(notices):find("pending text was not sent", 1, true) ~= nil, true)
+    if enabled then
+      expect.equality(#pickers, 2)
+      pickers[2].cb(nil)
+    else
+      expect.equality(#pickers, 1)
+      expect.equality(table.concat(notices):find("Herdr creation is disabled", 1, true) ~= nil, true)
+    end
+    expect.equality(#attached, 0)
+    expect.equality(count("workspace", "create"), 0)
+    expect.equality(count("agent", "start"), 0)
   end
 end
 

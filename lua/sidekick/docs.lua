@@ -7,6 +7,7 @@ function M.update()
 
   Docs.save({
     config = config,
+    session_creation = { content = table.concat(vim.fn.readfile("docs/session-creation.md"), "\n") },
     setup_base = Docs.extract("tests/fixtures/readme.lua", "local base = ({.-\n})"),
     setup_custom = Docs.extract("tests/fixtures/readme.lua", "local custom = ({.-\n})"),
     setup_blink = Docs.extract("tests/fixtures/readme.lua", "local blink = ({.-\n})"),
