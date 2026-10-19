@@ -102,7 +102,7 @@ function M.get(filter)
     end
   end
 
-  if not filter.attached and Config.cli.mux.backend ~= "herdr" then
+  if not filter.attached and Session.primary() ~= "herdr" and Config.cli.mux.backend ~= "herdr" then
     for name, tool in pairs(Config.tools()) do
       local sid = Session.sid({ tool = name })
       if not sids[sid] then

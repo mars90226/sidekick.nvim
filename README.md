@@ -268,6 +268,16 @@ local defaults = {
   -- Work with AI cli tools directly from within Neovim
   cli = {
     watch = true, -- notify Neovim of file changes done by AI CLI tools
+    -- Primary backend for explicit `require("sidekick.cli").new()` requests.
+    -- nil preserves the existing mux.enabled/backend behavior. Existing sessions
+    -- always use their own source backend, regardless of this setting.
+    -- A herdr primary or legacy mux backend hides not-started rows, so these
+    -- actions cannot implicitly create a tool or fall back to a local process.
+    primary_backend = nil, ---@type "terminal"|"tmux"|"zellij"|"herdr"?
+    -- Optional discovery overrides, independent of the primary backend.
+    -- Unset providers retain their defaults; terminal wrappers are always tracked.
+    -- The primary provider cannot be explicitly disabled.
+    discovery = {}, ---@type table<string, boolean>
     ---@class sidekick.win.Opts
     win = {
       --- This is run when a new terminal is created, before starting it.
@@ -318,11 +328,12 @@ local defaults = {
     ---@class sidekick.cli.Mux
     ---@field backend? "tmux"|"zellij"|"herdr" Multiplexer backend to persist CLI sessions
     mux = {
-      -- Experimental herdr attachment: set backend = "herdr" and choose an existing
-      -- running server below. Only existing agents are selectable; enabled does
-      -- not permit creating agents or falling back to a new local tool.
-      -- Selecting herdr activates discovery regardless of mux.enabled. The herdr
-      -- backend only attaches existing herdr agents. Other backends' sessions remain
+      -- Experimental herdr support: choose an existing running server below.
+      -- Set primary_backend = "herdr" for explicit New requests and discovery.herdr
+      -- = true to discover it with another primary. Creation also requires the
+      -- separate create.enabled opt-in; select/send never create a herdr agent.
+      -- Legacy mux.backend = "herdr" activates discovery regardless of mux.enabled.
+      -- Other backends' sessions remain
       -- visible and attachable, with their usual automatic-input behavior.
       -- Requires local Linux with the same /proc namespace, herdr on PATH, and
       -- identical client/server versions. Agent kinds must match configured tool names.
@@ -343,6 +354,28 @@ local defaults = {
       herdr = {
         -- Existing running herdr server name: 1-64 ASCII letters/digits/./_/-. "." and ".." are reserved.
         session = "default", ---@type string
+        -- Opt-in creation through the explicit New action only. Each request
+        -- creates a dedicated workspace in the existing server, using request cwd
+        -- (default: Neovim cwd captured before tool selection).
+        -- Only canonical interactive claude/codex commands with --model (and
+        -- Claude --effort) are supported. No prompt/resume/wrapper or env unsets.
+        -- Timeout/blocked outcomes are retained, never retried or sent to tmux.
+        -- Closing the UI never terminates the created agent. Automatic paste and
+        -- submit remain disabled. New returns an operation with id/phase/journal.
+        -- Inspect require("sidekick.cli.create").operations[id]; refresh(id) only
+        -- observes startup again, cancel(id) stops automatic attachment. Neither
+        -- retries creation nor terminates resources. Unresolved tool/cwd requests
+        -- stay reserved for this Neovim process. Journals under stdpath("state")/
+        -- sidekick/herdr-create retain IDs and replies with configured cmd/env
+        -- values redacted except operational metadata. Plain shell prompt
+        -- detection is conservative; fish/continuation `>` prompts are unsupported.
+        -- Journals retain evidence across restarts;
+        -- they are evidence, not automatic recovery or remote idempotency keys.
+        create = {
+          enabled = false,
+          workspace = "new", ---@type "new"
+          startup_timeout_ms = 30000, -- >3000 and <=300000; async client adds 15s
+        },
       },
       backend = vim.env.ZELLIJ and "zellij" or "tmux", -- default to tmux unless zellij is detected
       enabled = false,
@@ -553,6 +586,22 @@ require("sidekick.cli").focus(opts)
 ---@param opts? sidekick.cli.Hide
 ---@overload fun(name: string)
 require("sidekick.cli").hide(opts)
+```
+
+</td></tr>
+<tr><td> Open a CLI using the primary backend, after confirmation.
+Herdr creates a dedicated workspace. tmux/zellij may reuse an existing mux
+session with the same tool/cwd name. Sessions registered under this tool/cwd's
+Sidekick id are refused; discovered panes can have different ids.
+send/select never call this action. Returned operations have id/phase/journal.
+on_done runs once for a newly planned operation. Dismissed tool pickers,
+raised validation errors and deduplicated calls do not invoke a new callback.</td><td>
+
+
+```lua
+---@param opts? {name?:string, cwd?:string, focus?:boolean, on_done?:fun(op:table)}
+---@return table? operation Nil while choosing a tool.
+require("sidekick.cli").new(opts)
 ```
 
 </td></tr>

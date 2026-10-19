@@ -67,6 +67,19 @@ function M.prompt(opts)
   require("sidekick.cli.ui.prompt").select(opts)
 end
 
+--- Open a CLI using the primary backend, after confirmation.
+--- Herdr creates a dedicated workspace. tmux/zellij may reuse an existing mux
+--- session with the same tool/cwd name. Sessions registered under this tool/cwd's
+--- Sidekick id are refused; discovered panes can have different ids.
+--- send/select never call this action. Returned operations have id/phase/journal.
+--- on_done runs once for a newly planned operation. Dismissed tool pickers,
+--- raised validation errors and deduplicated calls do not invoke a new callback.
+---@param opts? {name?:string, cwd?:string, focus?:boolean, on_done?:fun(op:table)}
+---@return table? operation Nil while choosing a tool.
+function M.new(opts)
+  return require("sidekick.cli.create").new(opts)
+end
+
 --- Start or attach to a CLI tool
 ---@param opts? sidekick.cli.Select|{cb:nil}|{focus?:boolean}
 ---@overload fun(cb:fun(state?:sidekick.cli.State))

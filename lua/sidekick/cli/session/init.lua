@@ -80,12 +80,39 @@ function B.sessions()
   error("Backend:sessions() not implemented")
 end
 
+local function legacy_backend()
+  return (Config.cli.mux.enabled or Config.cli.mux.backend == "herdr") and Config.cli.mux.backend or "terminal"
+end
+
+-- Creation policy is separate from discovery and from an existing source's backend.
+function M.primary()
+  local primary = Config.cli.primary_backend or legacy_backend()
+  assert(vim.tbl_contains({ "terminal", "tmux", "zellij", "herdr" }, primary), "Invalid primary backend")
+  assert(type(Config.cli.discovery) == "table", "cli.discovery must be a table")
+  for _, value in pairs(Config.cli.discovery) do
+    assert(type(value) == "boolean", "cli.discovery values must be boolean")
+  end
+  assert(Config.cli.discovery[primary] ~= false, "Primary backend is disabled in cli.discovery")
+  return primary
+end
+
+function M.discovers(name)
+  if name == "terminal" then
+    return true
+  end
+  local value = Config.cli.discovery[name]
+  assert(value == nil or type(value) == "boolean", "cli.discovery values must be boolean")
+  if value ~= nil then
+    return value
+  end
+  return name ~= "herdr" or M.primary() == "herdr" or Config.cli.mux.backend == "herdr"
+end
+
 ---@param state sidekick.cli.session.Opts
 function M.new(state)
   local tool = state.tool
   tool = type(tool) == "string" and Config.get_tool(tool) or tool --[[@as sidekick.cli.Tool]]
-  local backend = state.backend
-    or ((Config.cli.mux.enabled or Config.cli.mux.backend == "herdr") and Config.cli.mux.backend or "terminal")
+  local backend = state.backend or legacy_backend()
   local super = assert(M.backends[backend], "unknown backend: " .. backend)
   local meta = getmetatable(state)
   local self = setmetatable(state, super) --[[@as sidekick.cli.Session]]
@@ -125,20 +152,23 @@ function M.setup()
   if M.did_setup then
     return
   end
-  M.did_setup = true
+  M.primary() -- Reject conflicting creation/discovery policies before registering providers.
   Config.tools() -- load tools, since they may register session backends
   local session_backends =
     { tmux = "sidekick.cli.session.tmux", zellij = "sidekick.cli.session.zellij", herdr = "sidekick.cli.session.herdr" }
   for name, mod in pairs(session_backends) do
-    if name == "herdr" and Config.cli.mux.backend == "herdr" then
+    -- A provider may still execute legacy starts even when its discovery is off.
+    local needed = M.discovers(name) or name == legacy_backend()
+    if name == "herdr" and needed then
       -- Register even when the executable is missing so discovery can explain
       -- the failure without offering to launch a different local tool.
       M.register(name, require(mod))
-    elseif name ~= "herdr" and vim.fn.executable(name) == 1 then
+    elseif name ~= "herdr" and needed and vim.fn.executable(name) == 1 then
       M.register(name, require(mod))
     end
   end
   M.register("terminal", require("sidekick.cli.terminal"))
+  M.did_setup = true
 end
 
 function M.sessions()
@@ -147,7 +177,10 @@ function M.sessions()
   local ids = {} ---@type table<string,boolean>
   local presence = {} ---@type table<string,table<string,boolean>>
   for name, backend in pairs(M.backends) do
-    local discovered, observed = backend:sessions()
+    local discovered, observed = {}, nil
+    if M.discovers(name) then
+      discovered, observed = backend:sessions()
+    end
     presence[name] = type(observed) == "table" and observed or nil
     for _, s in pairs(discovered) do
       s.backend = name
