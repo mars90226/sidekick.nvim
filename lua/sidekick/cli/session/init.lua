@@ -15,6 +15,10 @@ M._attached = {} ---@type table<string,sidekick.cli.Session>
 ---@field backend? string
 ---@field started? boolean
 ---@field external? boolean external sessions won't be opened in a terminal
+---@field source_id? string Identity of an already-discovered source hidden by a live wrapper
+---@field manual_input? boolean Internal herdr attachment policy: parent.validate required; no restart/automatic input, validate before show, close on client exit, local launch cwd
+---@field validate? fun(self:sidekick.cli.Session):boolean, string?
+---@field same_owner? fun(self:sidekick.cli.Session, other:sidekick.cli.Session):boolean
 ---@field parent? sidekick.cli.Session
 ---@field mux_session? string
 ---@field mux_backend? string
@@ -71,6 +75,7 @@ end
 
 --- List all active sessions for this backend
 ---@return sidekick.cli.session.State[]
+---@return table<string,boolean>? observed_ids Optional authoritative presence map; false confirms a foreground shell, nil leaves absence unknown.
 function B.sessions()
   error("Backend:sessions() not implemented")
 end
@@ -79,7 +84,8 @@ end
 function M.new(state)
   local tool = state.tool
   tool = type(tool) == "string" and Config.get_tool(tool) or tool --[[@as sidekick.cli.Tool]]
-  local backend = state.backend or (Config.cli.mux.enabled and Config.cli.mux.backend or "terminal")
+  local backend = state.backend
+    or ((Config.cli.mux.enabled or Config.cli.mux.backend == "herdr") and Config.cli.mux.backend or "terminal")
   local super = assert(M.backends[backend], "unknown backend: " .. backend)
   local meta = getmetatable(state)
   local self = setmetatable(state, super) --[[@as sidekick.cli.Session]]
@@ -121,9 +127,14 @@ function M.setup()
   end
   M.did_setup = true
   Config.tools() -- load tools, since they may register session backends
-  local session_backends = { tmux = "sidekick.cli.session.tmux", zellij = "sidekick.cli.session.zellij" }
+  local session_backends =
+    { tmux = "sidekick.cli.session.tmux", zellij = "sidekick.cli.session.zellij", herdr = "sidekick.cli.session.herdr" }
   for name, mod in pairs(session_backends) do
-    if vim.fn.executable(name) == 1 then
+    if name == "herdr" and Config.cli.mux.backend == "herdr" then
+      -- Register even when the executable is missing so discovery can explain
+      -- the failure without offering to launch a different local tool.
+      M.register(name, require(mod))
+    elseif name ~= "herdr" and vim.fn.executable(name) == 1 then
       M.register(name, require(mod))
     end
   end
@@ -134,8 +145,11 @@ function M.sessions()
   M.setup()
   local ret = {} ---@type sidekick.cli.Session[]
   local ids = {} ---@type table<string,boolean>
+  local presence = {} ---@type table<string,table<string,boolean>>
   for name, backend in pairs(M.backends) do
-    for _, s in pairs(backend:sessions()) do
+    local discovered, observed = backend:sessions()
+    presence[name] = type(observed) == "table" and observed or nil
+    for _, s in pairs(discovered) do
       s.backend = name
       s.started = true
       ret[#ret + 1] = M.new(s)
@@ -146,6 +160,48 @@ function M.sessions()
       end
     end
   end
+  local sources = {}
+  for _, s in ipairs(ret) do
+    sources[s.id] = s
+  end
+  local active = {}
+  for _, s in ipairs(ret) do
+    local source = s.source_id and sources[s.source_id]
+    if s.source_id and s.parent and s.parent.same_owner then
+      local reason
+      if source then
+        if s.parent:same_owner(source) then
+          -- Refresh metadata only for the same owner, including its display cwd.
+          s.parent, s.cwd, s.sid = source, source.cwd, source.sid
+        else
+          reason = "owner identity changed"
+        end
+      else
+        local observed = presence[s.mux_backend]
+        if observed and observed[s.source_id] == false then
+          reason = "pane foreground returned to its shell"
+        elseif observed and not observed[s.source_id] then
+          reason = "agent is no longer detected in the server snapshot"
+        else
+          s.parent.agent_status = "unknown" -- Discovery failure is not confirmed absence.
+        end
+      end
+      if reason then
+        s:close()
+        Util.warn(
+          "Herdr attachment `"
+            .. (s.parent.agent_name or s.tool.name)
+            .. "` closed: "
+            .. reason
+            .. "; select the existing agent again"
+        )
+      end
+    end
+    if not s.closed then
+      active[#active + 1] = s
+    end
+  end
+  ret = active
   for id in pairs(M._attached) do
     if not ids[id] then -- session is no longer running
       M.detach(M._attached[id])
@@ -173,6 +229,7 @@ function M.attach(session)
   end
   ---@type sidekick.cli.terminal.Cmd?
   local cmd
+  local source_id = session.started and session.id or nil
   if session.started then
     cmd = session:attach()
   else
@@ -182,7 +239,9 @@ function M.attach(session)
     session = M.new({
       tool = session.tool:clone({ cmd = cmd.cmd, env = cmd.env }),
       cwd = session.cwd,
-      id = "terminal: " .. session.sid,
+      id = "terminal: " .. session.id,
+      source_id = source_id,
+      manual_input = session.manual_input,
       backend = "terminal",
       mux_backend = session.backend,
       mux_session = session.mux_session,

@@ -82,8 +82,34 @@ local defaults = {
       nav = nil,
     },
     ---@class sidekick.cli.Mux
-    ---@field backend? "tmux"|"zellij" Multiplexer backend to persist CLI sessions
+    ---@field backend? "tmux"|"zellij"|"herdr" Multiplexer backend to persist CLI sessions
     mux = {
+      -- Experimental herdr attachment: set backend = "herdr" and choose an existing
+      -- running server below. Only existing agents are selectable; enabled does
+      -- not permit creating agents or falling back to a new local tool.
+      -- Selecting herdr activates discovery regardless of mux.enabled. The herdr
+      -- backend only attaches existing herdr agents. Other backends' sessions remain
+      -- visible and attachable, with their usual automatic-input behavior.
+      -- Requires local Linux with the same /proc namespace, herdr on PATH, and
+      -- identical client/server versions. Agent kinds must match configured tool names.
+      -- Requires a valid pane shell PID distinct from the agent foreground group;
+      -- agents launched as the pane root process are not supported.
+      -- Conflicting clients fail without takeover/retry. Closing a client preserves
+      -- the agent; reselect explicitly after a disconnect. Only herdr attachments
+      -- disable automatic paste/submit; manual terminal input is available.
+      -- Discovery retires a changed or confirmed missing owner, or a confirmed
+      -- foreground shell, with a warning. Unknown process evidence is not a shell.
+      -- Failed discovery or unknown process evidence keeps the client with unknown status.
+      -- Ownership is checked before attach/show and terminal ID + socket are pinned.
+      -- These checks are not atomic: replacement after a check or while the window
+      -- is already visible may receive manual input. No strict occupant binding is claimed.
+      -- Discovery and attach/show/focus ownership checks use bounded synchronous
+      -- CLI calls (up to 1.5s each), may repeat per action, and can block the UI.
+      ---@class sidekick.cli.Herdr
+      herdr = {
+        -- Existing running herdr server name: 1-64 ASCII letters/digits/./_/-. "." and ".." are reserved.
+        session = "default", ---@type string
+      },
       backend = vim.env.ZELLIJ and "zellij" or "tmux", -- default to tmux unless zellij is detected
       enabled = false,
       -- terminal: new sessions will be created for each CLI tool and shown in a Neovim terminal
@@ -222,7 +248,7 @@ function M.setup(opts)
     require("sidekick.status").setup()
 
     M.validate("cli.win.layout", { "float", "left", "bottom", "top", "right" })
-    M.validate("cli.mux.backend", { "tmux", "zellij" })
+    M.validate("cli.mux.backend", { "tmux", "zellij", "herdr" })
     M.validate("cli.mux.create", { "terminal", "window", "split" })
     M.validate("nes.diff.show", { "always", "cursor" })
   end)

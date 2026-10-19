@@ -73,10 +73,17 @@ function M.get(filter)
   local cwd = Session.cwd()
   local sessions = filter.attached and Session.attached() or Session.sessions()
 
+  local sources = {}
   for _, s in pairs(sessions) do
-    -- if not attached, skip if another session with higher priority
-    -- is running with overlapping pids
-    local skip = false
+    if s.source_id and s:is_running() then
+      sources[s.source_id] = true
+    end
+  end
+
+  for _, s in pairs(sessions) do
+    -- A live wrapper hides its identified source. Otherwise retain the normal
+    -- priority/PID dedupe, including rediscovery after a client exits.
+    local skip = sources[s.id] == true
     if not s:is_attached() then
       for _, s2 in pairs(sessions) do
         if s2 ~= s and Util.overlaps(s2.pids or {}, s.pids or {}) and s2.priority > s.priority then
@@ -95,7 +102,7 @@ function M.get(filter)
     end
   end
 
-  if not filter.attached then
+  if not filter.attached and Config.cli.mux.backend ~= "herdr" then
     for name, tool in pairs(Config.tools()) do
       local sid = Session.sid({ tool = name })
       if not sids[sid] then
@@ -160,13 +167,19 @@ function M.with(cb, opts)
   if #attached == 0 and opts.attach then
     if target_current_cwd then
       local current = M.get(Util.merge(opts.filter, { cwd = true }))
-      local has_current_session = vim.tbl_contains(vim.tbl_map(function(state)
-        return state.session ~= nil
-      end, current), true)
+      local has_current_session = vim.tbl_contains(
+        vim.tbl_map(function(state)
+          return state.session ~= nil
+        end, current),
+        true
+      )
       local started = M.get(Util.merge(opts.filter, { started = true }))
-      local has_other_session = vim.tbl_contains(vim.tbl_map(function(state)
-        return state.session ~= nil and state.session.cwd ~= cwd
-      end, started), true)
+      local has_other_session = vim.tbl_contains(
+        vim.tbl_map(function(state)
+          return state.session ~= nil and state.session.cwd ~= cwd
+        end, started),
+        true
+      )
 
       if has_current_session and #current == 1 then
         use(current[1])
@@ -179,7 +192,8 @@ function M.with(cb, opts)
 
     require("sidekick.cli.ui.select").select({
       auto = true,
-      filter = target_current_cwd and opts.filter or Util.merge(opts.filter, target_current_cwd and { cwd = true } or nil),
+      filter = target_current_cwd and opts.filter
+        or Util.merge(opts.filter, target_current_cwd and { cwd = true } or nil),
       cb = use,
     })
   elseif #attached > 1 and not opts.all then

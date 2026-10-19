@@ -92,7 +92,15 @@ end
 
 ---@return sidekick.cli.session.State[]
 function M.sessions()
-  return vim.tbl_values(M.terminals)
+  local ret = {}
+  for _, terminal in ipairs(vim.tbl_values(M.terminals)) do
+    if terminal.manual_input and terminal.started and not terminal:is_running() then
+      terminal:close()
+    else
+      ret[#ret + 1] = terminal
+    end
+  end
+  return ret
 end
 
 ---@param opts sidekick.cli.session.Opts
@@ -102,6 +110,10 @@ function M.new(opts)
 end
 
 function M:init()
+  assert(
+    not self.manual_input or (self.parent and type(self.parent.validate) == "function"),
+    "Herdr manual attachment requires a parent with validate()"
+  )
   self.opts = vim.deepcopy(Config.cli.win)
   self.ctime = vim.uv.hrtime()
   self.atime = self.ctime
@@ -148,6 +160,17 @@ function M:start()
   if self:is_running() then
     return
   end
+  if self.manual_input then
+    if self.closed or self.job then
+      self:close()
+      error("Herdr attachment ended; select the agent again")
+    end
+    local valid, reason = self.parent:validate()
+    if not valid then
+      self:close()
+      error("Herdr target unavailable: " .. tostring(reason) .. "; select the agent again")
+    end
+  end
 
   self.buf = vim.api.nvim_create_buf(false, true)
   self:bo()
@@ -190,6 +213,13 @@ function M:start()
     group = self.group,
     buffer = self.buf,
     callback = function()
+      if self.manual_input then
+        self:report_exit(vim.v.event.status)
+        vim.schedule(function()
+          self:close()
+        end)
+        return
+      end
       local ms = (vim.uv.hrtime() - self.atime) / 1e6
       if ms < TERM_CLOSE_DELAY then
         -- don't close if the terminal closed too quickly
@@ -294,7 +324,9 @@ function M:start()
       end
     end
     self.job = vim.fn.jobstart(norm_cmd, {
-      cwd = self.cwd,
+      -- The attached agent may outlive its working directory. Its cwd remains
+      -- session metadata; the local attachment client only needs a valid cwd.
+      cwd = self.manual_input and vim.fn.getcwd(0) or self.cwd,
       term = true,
       clear_env = true,
       env = not vim.tbl_isempty(env) and env or nil,
@@ -412,6 +444,13 @@ function M:is_focused()
 end
 
 function M:show()
+  if self.manual_input then
+    local valid, reason = self.parent:validate()
+    if not valid then
+      self:close()
+      error("Herdr target unavailable: " .. tostring(reason) .. "; select the agent again")
+    end
+  end
   self:start()
   if not self:is_running() then
     return
@@ -447,11 +486,40 @@ function M:detach()
   return self
 end
 
+-- Preserve an attach failure before any cleanup path deletes its terminal buffer.
+function M:report_exit(status)
+  if self.closed or self.exit_reported then
+    return
+  end
+  if type(status) == "number" and status >= 0 then
+    self.exit_status = status
+  end
+  if self.exit_status == 0 then
+    return
+  end
+  self.exit_reported = true
+  local lines = self:buf_valid() and vim.api.nvim_buf_get_lines(self.buf, 0, -1, false) or {}
+  lines = vim.tbl_filter(function(line)
+    return line:match("%S") ~= nil
+  end, lines)
+  local tail = table.concat(vim.list_slice(lines, math.max(1, #lines - 2)), "\n"):sub(-800)
+  Util.error(
+    "Herdr attach client ended (status "
+      .. tostring(self.exit_status or "unknown")
+      .. "); select the existing agent again"
+      .. (tail ~= "" and (":\n" .. tail) or "")
+  )
+end
+
 function M:close()
   if self.closed then
     return self
   end
+  if self.manual_input and self.job and not self:is_running() then
+    self:report_exit(vim.fn.jobwait({ self.job }, 0)[1])
+  end
   self.closed = true
+  self.send_queue = {}
 
   M.terminals[self.id] = nil
   if vim.tbl_isempty(M.terminals) then
@@ -491,6 +559,10 @@ end
 
 ---@param input string
 function M:send(input)
+  if self.manual_input then
+    Util.warn("Herdr PoC: use manual terminal input; automatic paste and submit are disabled")
+    return
+  end
   self:show()
   if not self:is_running() then
     return
@@ -511,6 +583,9 @@ function M:keys(buf)
   local Actions = require("sidekick.cli.actions")
   ---@type table<string, sidekick.cli.Keymap|false>
   local keys = vim.tbl_extend("force", {}, self.opts.keys, self.tool.keys or {})
+  if self.manual_input then
+    keys.buffers = false
+  end
   for name, km in pairs(keys) do
     if type(km) == "table" then
       local lhs, rhs = km[1], km[2] or name
