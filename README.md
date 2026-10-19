@@ -623,7 +623,10 @@ New captures Neovim's working directory (check `:pwd`) before the picker opens,
 unless the API or command supplies `cwd`. Changing cwd afterward does not retarget
 that request. Each confirmed herdr New creates a dedicated workspace in the
 selected existing server. The same tool in different directories has independent
-requests; switching projects does not force attachment to the other project.
+requests. Use explicit New to create in the requested project. The inherited
+`toggle`/`show`/`send` automatic selection may still attach to a sole matching
+source in another directory. Use `:Sidekick cli select` for an explicit choice
+between that source and New.
 Selecting an existing row attaches that exact source, including one in another
 directory. Terminal/tmux/zellij New refuses a session already registered under
 the same Sidekick tool/cwd ID; select that session explicitly. Otherwise
@@ -637,7 +640,10 @@ tool for New; legacy tmux tool rows keep their existing custom command behavior.
 
 New requires a separate confirmation. Dismissing any picker creates no workspace or agent;
 repeated selections while a request is pending reuse it. An uncertain startup
-is retained for inspection and is not automatically retried. Existing live
+is retained for inspection and is not automatically retried. Its tool/cwd stays
+reserved in that Neovim process while the outcome is unresolved. Inspect
+`require("sidekick.cli.create").operations[id]`; `refresh(id)` only observes
+startup again, and `cancel(id)` neither retries nor terminates resources. Existing live
 sources remain selectable. A New selected during a send action cancels that send
 payload instead of sending it to the newly created agent, with a notice to re-enter
 it after attaching. Herdr attachments
@@ -681,8 +687,8 @@ require("sidekick.cli").hide(opts)
 </td></tr>
 <tr><td><code>:Sidekick cli new</code> Open a CLI using the primary backend, after confirmation.
 Herdr creates a dedicated workspace. tmux/zellij may reuse an existing mux
-session with the same tool/cwd name. Sessions registered under this tool/cwd's
-Sidekick id are refused; discovered panes can have different ids.
+session with the same tool/cwd name. Non-herdr requests refuse sessions registered
+under this tool/cwd's Sidekick id; discovered panes can have different ids.
 Select offers an explicit New action; choosing an existing session row only attaches.
 New never submits a pending send payload. Returned operations have id/phase/journal.
 on_done runs once for a newly planned operation. Dismissed tool pickers,

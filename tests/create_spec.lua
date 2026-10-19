@@ -1998,7 +1998,22 @@ for _, enabled in ipairs({ false, true }) do
     Config.cli.mux.backend = "herdr" -- No legacy placeholders: the only picker item is explicit New.
     Config.cli.mux.herdr.create.enabled = enabled
     local pickers = selector()
-    require("sidekick.cli").send({ name = "codex", text = { { "pending fixture message" } } })
+    local send_count, submit_count, focus_count = 0, 0, 0
+    local attach_source = Session.attach
+    Session.attach = function(source)
+      local terminal = attach_source(source)
+      terminal.send = function()
+        send_count = send_count + 1
+      end
+      terminal.submit = function()
+        submit_count = submit_count + 1
+      end
+      terminal.focus = function()
+        focus_count = focus_count + 1
+      end
+      return terminal
+    end
+    require("sidekick.cli").send({ name = "codex", focus = false, text = { { "pending fixture message" } } })
     expect.equality(
       vim.wait(1000, function()
         return #pickers == 1
@@ -2010,14 +2025,21 @@ for _, enabled in ipairs({ false, true }) do
     expect.equality(table.concat(notices):find("pending text was not sent", 1, true) ~= nil, true)
     if enabled then
       expect.equality(#pickers, 2)
-      pickers[2].cb(nil)
+      local op = pickers[2].items[1]
+      expect.equality(op.focus, false)
+      pickers[2].cb(op)
+      wait(op)
+      expect.equality(op.phase, "attached")
     else
       expect.equality(#pickers, 1)
       expect.equality(table.concat(notices):find("Herdr creation is disabled", 1, true) ~= nil, true)
     end
-    expect.equality(#attached, 0)
-    expect.equality(count("workspace", "create"), 0)
-    expect.equality(count("agent", "start"), 0)
+    expect.equality(#attached, enabled and 1 or 0)
+    expect.equality(send_count, 0)
+    expect.equality(submit_count, 0)
+    expect.equality(focus_count, 0)
+    expect.equality(count("workspace", "create"), enabled and 1 or 0)
+    expect.equality(count("agent", "start"), enabled and 1 or 0)
   end
 end
 

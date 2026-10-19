@@ -69,8 +69,8 @@ end
 
 --- Open a CLI using the primary backend, after confirmation.
 --- Herdr creates a dedicated workspace. tmux/zellij may reuse an existing mux
---- session with the same tool/cwd name. Sessions registered under this tool/cwd's
---- Sidekick id are refused; discovered panes can have different ids.
+--- session with the same tool/cwd name. Non-herdr requests refuse sessions registered
+--- under this tool/cwd's Sidekick id; discovered panes can have different ids.
 --- Select offers an explicit New action; choosing an existing session row only attaches.
 --- New never submits a pending send payload. Returned operations have id/phase/journal.
 --- on_done runs once for a newly planned operation. Dismissed tool pickers,

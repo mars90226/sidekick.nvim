@@ -195,6 +195,7 @@ function M.with(cb, opts)
     require("sidekick.cli.ui.select").select({
       auto = true,
       pending_send = opts.pending_send,
+      focus = opts.focus,
       filter = target_current_cwd and opts.filter
         or Util.merge(opts.filter, target_current_cwd and { cwd = true } or nil),
       cb = use,
