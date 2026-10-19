@@ -30,6 +30,7 @@ local M = {}
 ---@field focus? boolean
 ---@field attach? boolean
 ---@field all? boolean
+---@field new_focus? boolean Internal New focus intent, independent of pre-callback attachment focus.
 ---@field pending_send? boolean Internal marker: New must report cancellation of this send.
 
 ---@param t sidekick.cli.State
@@ -192,10 +193,14 @@ function M.with(cb, opts)
       end
     end
 
+    local new_focus = opts.new_focus
+    if new_focus == nil then
+      new_focus = opts.focus
+    end
     require("sidekick.cli.ui.select").select({
       auto = true,
       pending_send = opts.pending_send,
-      focus = opts.focus,
+      focus = new_focus,
       filter = target_current_cwd and opts.filter
         or Util.merge(opts.filter, target_current_cwd and { cwd = true } or nil),
       cb = use,

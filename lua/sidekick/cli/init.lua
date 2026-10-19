@@ -125,6 +125,7 @@ function M.toggle(opts)
     end
   end, {
     attach = true,
+    new_focus = opts.focus,
     filter = opts.filter,
   })
 end
@@ -146,7 +147,8 @@ function M.focus(opts)
   end, {
     attach = true,
     filter = opts.filter,
-    focus = false,
+    focus = false, -- The callback handles existing-session focus.
+    new_focus = true,
     show = true,
   })
 end

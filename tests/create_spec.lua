@@ -2043,4 +2043,72 @@ for _, enabled in ipairs({ false, true }) do
   end
 end
 
+for _, entry in ipairs({ "select", "show", "toggle", "focus", "send" }) do
+  for _, intent in ipairs({
+    { label = "default" },
+    { label = "false", value = false },
+    { label = "true", value = true },
+  }) do
+    for _, filtered in ipairs({ false, true }) do
+      T["New focus intent: " .. entry .. " " .. intent.label .. " filtered=" .. tostring(filtered)] = function()
+        Config.cli.mux.backend = "herdr" -- No legacy rows; explicit New must still require selection.
+        local pickers = selector()
+        local focus_count, sends = 0, 0
+        local attach_source = Session.attach
+        Session.attach = function(source)
+          local terminal = attach_source(source)
+          terminal.focus = function()
+            focus_count = focus_count + 1
+          end
+          terminal.send = function()
+            sends = sends + 1
+          end
+          terminal.submit = function()
+            sends = sends + 1
+          end
+          return terminal
+        end
+        local opts = { focus = intent.value }
+        if filtered then
+          if entry == "select" then
+            opts.filter = { name = "codex" }
+          else
+            opts.name = "codex"
+          end
+        end
+        if entry == "send" then
+          opts.text = { { "pending matrix fixture" } }
+        end
+        require("sidekick.cli")[entry](opts)
+        expect.equality(
+          vim.wait(1000, function()
+            return #pickers == 1
+          end),
+          true
+        )
+        expect.equality(pickers[1].items[1].new, true)
+        pickers[1].cb(pickers[1].items[1])
+        local confirmation = 2
+        if not filtered then
+          expect.equality(pickers[2].items, { "claude", "codex" })
+          pickers[2].cb("codex")
+          confirmation = 3
+        end
+        local op = pickers[confirmation].items[1]
+        local expected = entry == "focus" or intent.value ~= false
+        expect.equality(op.focus ~= false, expected)
+        expect.equality(count("workspace", "create"), 0)
+        pickers[confirmation].cb(op)
+        wait(op)
+        expect.equality(op.phase, "attached")
+        expect.equality(focus_count, expected and 1 or 0)
+        expect.equality(sends, 0)
+        expect.equality(#attached, 1)
+        expect.equality(count("workspace", "create"), 1)
+        expect.equality(count("agent", "start"), 1)
+      end
+    end
+  end
+end
+
 return T
