@@ -96,8 +96,9 @@ local defaults = {
     mux = {
       -- Experimental herdr support: choose an existing running server below.
       -- Set primary_backend = "herdr" for explicit New requests and discovery.herdr
-      -- = true to discover it with another primary. Creation also requires the
-      -- separate create.enabled opt-in. Only the explicit New action creates herdr agents;
+      -- = true to discover it with another primary. Explicit primary_backend = "herdr"
+      -- also opts into New; inherited herdr routing requires create.enabled = true.
+      -- create.enabled = false always disables creation. Only explicit New creates agents;
       -- existing session rows attach, and New never forwards a pending send payload.
       -- Legacy mux.backend = "herdr" activates discovery regardless of mux.enabled.
       -- Other backends' sessions remain
@@ -107,7 +108,10 @@ local defaults = {
       -- Requires a valid pane shell PID distinct from the agent foreground group;
       -- agents launched as the pane root process are not supported.
       -- Conflicting clients fail without takeover/retry. Closing a client preserves
-      -- the agent; reselect explicitly after a disconnect. Only herdr attachments
+      -- the agent. On disconnect, a bounded read-only query of the pinned socket
+      -- checks the full terminal inventory. Confirmed absence is a warning with
+      -- client diagnostics, not proof of a successful agent exit. Failed/unknown
+      -- queries remain errors. Only herdr attachments
       -- disable automatic paste/submit; manual terminal input is available.
       -- Discovery retires a changed or confirmed missing owner, or a confirmed
       -- foreground shell, with a warning. Unknown process evidence is not a shell.
@@ -138,8 +142,12 @@ local defaults = {
         -- detection is conservative; fish/continuation `>` prompts are unsupported.
         -- Journals retain evidence across restarts;
         -- they are evidence, not automatic recovery or remote idempotency keys.
+        -- Timing entries use fixed stage labels and monotonic elapsed/duration ms;
+        -- confirmation time is excluded, and no input or env values enter timing fields.
         create = {
-          enabled = false,
+          -- nil: enabled by explicit cli.primary_backend = "herdr" only.
+          -- true: also opt in with inherited legacy herdr routing. false: always disable.
+          enabled = nil, ---@type boolean?
           workspace = "new", ---@type "new"
           startup_timeout_ms = 30000, -- >3000 and <=300000; async client adds 15s
         },

@@ -68,7 +68,41 @@ local function redact_reply(op, value, json)
   return vim.json.encode(decoded)
 end
 
+-- Timing contains only fixed stage labels and monotonic durations, never argv,
+-- environment values or user input. Confirmation time is excluded.
+local function stage(op, name)
+  -- Automatic late replies may reconcile ownership, but cannot reopen a cancelled clock.
+  if op.cancelled and op._clock_end then
+    return
+  end
+  local now = vim.uv.hrtime()
+  op._clock_start = op._clock_start or now
+  if op._stage_start then
+    op.timings[#op.timings].duration_ms = (now - op._stage_start) / 1e6
+  end
+  op._stage_start, op._clock_end = now, nil
+  op.timings[#op.timings + 1] = { stage = name, elapsed_ms = (now - op._clock_start) / 1e6, duration_ms = 0 }
+end
+
+local function timing(op)
+  local now = op._clock_end or vim.uv.hrtime()
+  local timings = vim.deepcopy(op.timings)
+  if op._stage_start then
+    timings[#timings].duration_ms = (now - op._stage_start) / 1e6
+  end
+  return timings, op._clock_start and (now - op._clock_start) / 1e6 or 0
+end
+
+local function stop_timing(op)
+  op._clock_end = op._clock_end or vim.uv.hrtime()
+  if op._stage_start then
+    op.timings[#op.timings].duration_ms = (op._clock_end - op._stage_start) / 1e6
+    op._stage_start = nil
+  end
+end
+
 local function complete(op)
+  stop_timing(op)
   if M.pending[op.key] == op and (op.phase == "attached" or op.phase == "ready" or not op.workspace_dispatched) then
     M.pending[op.key] = nil
   end
@@ -119,6 +153,7 @@ local function save(op, preserve_outcome)
   }) do
     data[key] = op[key]
   end
+  data.timings, data.elapsed_ms = timing(op)
   local ok, err = pcall(function()
     local encoded = vim.json.encode(data) .. "\n"
     local dir = vim.fs.dirname(op.journal)
@@ -147,6 +182,7 @@ local function finish(op, phase, reason)
     reason = (reason or "Agent startup is uncertain") .. "; agent start: " .. op.start_error
   end
   op.phase, op.error = phase, reason and redact(op, reason) or nil
+  stop_timing(op)
   save(op, true)
   if reason then
     Util.warn(
@@ -188,6 +224,7 @@ local function call(op, args, timeout, json, cb)
   -- Pin every operation to the captured endpoint; tool env is only for the new workspace.
   local env = vim.uv.os_environ()
   env.HERDR_SESSION, env.HERDR_SOCKET_PATH = nil, op.endpoint.socket
+  local started_at = vim.uv.hrtime()
   local ok, err = pcall(
     vim.system,
     Herdr.command(args, op.endpoint.name),
@@ -205,6 +242,7 @@ local function call(op, args, timeout, json, cb)
       op.records[#op.records + 1] = {
         command = args[1] .. " " .. (args[2] or ""),
         code = result.code,
+        duration_ms = (vim.uv.hrtime() - started_at) / 1e6,
         stdout = redact_reply(op, result.stdout, json),
         stderr = redact(op, result.stderr),
       }
@@ -343,8 +381,13 @@ local function check_shell(op, cb)
               same_directory = false
               break
             end
-            same_directory = same_directory and same_cwd(proc.cwd, op.real_cwd)
-            shell_present = shell_present or (proc.pid == info.shell_pid and shells[proc.name] == true)
+            -- herdr may omit cwd for a short-lived startup child.
+            -- Unknown child cwd permits passive waiting only;
+            -- sending still requires one fully identified shell below.
+            same_directory = same_directory
+              and (proc.cwd == nil or proc.cwd == vim.NIL or same_cwd(proc.cwd, op.real_cwd))
+            shell_present = shell_present
+              or (proc.pid == info.shell_pid and shells[proc.name] == true and same_cwd(proc.cwd, op.real_cwd))
           end
           if shell_present and same_directory then
             return vim.defer_fn(read_process, 100)
@@ -390,6 +433,7 @@ local function check_shell(op, cb)
 end
 
 local function verify(op, attach)
+  stage(op, "verifying_agent")
   op.phase = "verifying"
   call(op, { "agent", "get", op.name }, 2000, true, function(value, err)
     local agent = value and value.result and value.result.agent
@@ -412,6 +456,7 @@ local function verify(op, attach)
       return finish(op, "unknown", "Agent is not confirmed ready; inspect " .. op.pane .. " and refresh")
     end
     Herdr._command_error = nil
+    local started_at = vim.uv.hrtime()
     local process, foreground = Herdr.process_identity(op.endpoint, op.pane)
     local reason = not process
         and (foreground or Herdr._command_error or "Process identity/query evidence is unavailable")
@@ -419,6 +464,7 @@ local function verify(op, attach)
     op.records[#op.records + 1] = {
       command = "pane process-info",
       kind = "identity",
+      duration_ms = (vim.uv.hrtime() - started_at) / 1e6,
       process_identity = process,
       reason = reason and redact(op, reason) or nil,
     }
@@ -449,11 +495,13 @@ local function verify(op, attach)
         return finish(op, "ready", "Agent already has a registered attachment; select it explicitly")
       end
     end
+    stage(op, "attaching")
     local ok, result = pcall(function()
       local terminal = Session.attach(source)
-      terminal:show()
       if op.focus ~= false then
-        terminal:focus()
+        terminal:focus() -- focus() already shows and validates the terminal.
+      else
+        terminal:show()
       end
       return terminal
     end)
@@ -466,9 +514,11 @@ local function verify(op, attach)
 end
 
 local function start_agent(op)
+  stage(op, "shell_before_start")
   check_shell(op, function()
     server(op, function()
       assert(not op.start_dispatched, "Agent start already dispatched")
+      stage(op, "starting_agent")
       op.phase, op.start_dispatched = "launching", true
       if not save(op) then
         op.start_dispatched = false -- The start command has not been invoked.
@@ -494,8 +544,10 @@ local function start_agent(op)
 end
 
 local function probe(op)
+  stage(op, "shell_before_probe")
   check_shell(op, function()
     server(op, function()
+      stage(op, "executable_probe")
       op.phase = "checking_executable"
       local marker = "SK_EXEC_" .. op.id .. "="
       local command = "printf '\\n" .. marker .. "'; command -v " .. op.tool
@@ -535,15 +587,17 @@ local function begin(op)
   if op.cancelled then
     return
   end
+  stage(op, "preflight")
   op.phase = "checking_server"
   Herdr._command_error = nil
   local endpoint = Herdr.endpoint()
-  local snapshot = endpoint and Herdr.snapshot(endpoint)
-  if not snapshot then
+  local version = endpoint and Herdr.client_version()
+  if not version then
     return finish(op, "failed", Herdr._command_error or "Existing herdr server is unavailable")
   end
-  op.endpoint, op.version = endpoint, snapshot.version
+  op.endpoint, op.version = endpoint, version
   server(op, function()
+    stage(op, "creating_workspace")
     op.phase, op.workspace_dispatched = "creating_workspace", true
     if not save(op) then
       op.workspace_dispatched = false -- No command was invoked; release this reservation.
@@ -586,9 +640,18 @@ local function plan(opts)
   if backend == "herdr" then
     assert(vim.uv.os_uname().sysname == "Linux", "Herdr creation requires local Linux")
     local config = Config.cli.mux.herdr.create
+    assert(type(config) == "table", "cli.mux.herdr.create must be a table")
     assert(
-      type(config) == "table" and config.enabled == true,
-      "Herdr creation is disabled; enable cli.mux.herdr.create.enabled"
+      config.enabled == nil or type(config.enabled) == "boolean",
+      "Invalid herdr create.enabled (expected boolean)"
+    )
+    local enabled = config.enabled
+    if enabled == nil then
+      enabled = Config.cli.primary_backend == "herdr"
+    end
+    assert(
+      enabled,
+      "Herdr creation is disabled; set cli.primary_backend = 'herdr' or cli.mux.herdr.create.enabled = true"
     )
     assert(config.workspace == "new", "Herdr creation only supports dedicated new workspaces")
     timeout = config.startup_timeout_ms
@@ -667,6 +730,7 @@ local function plan(opts)
     executable = executable,
     phase = "planned",
     records = {},
+    timings = {},
     generation = M.generation,
     journal = vim.fn.stdpath("state") .. "/sidekick/herdr-create/" .. id .. ".json",
     focus = opts.focus,
@@ -676,7 +740,7 @@ local function plan(opts)
   return op
 end
 
-function M.new(opts)
+function M.new(opts, confirmed)
   opts = opts or {}
   if not opts.name then
     local cwd = Session.cwd({ cwd = opts.cwd }) -- Capture before asynchronous tool selection.
@@ -702,13 +766,7 @@ function M.new(opts)
     return op
   end
   op.phase = "confirming"
-  vim.ui.select({ op }, {
-    prompt = (op.backend == "tmux" or op.backend == "zellij") and "Open mux session (may reuse existing)?"
-      or "Create new agent?",
-    format_item = function()
-      return op.tool .. " via " .. op.backend .. " in " .. op.cwd
-    end,
-  }, function(selected)
+  local function dispatch(selected)
     if op.phase ~= "confirming" then
       return
     end
@@ -718,6 +776,7 @@ function M.new(opts)
     if op.backend == "herdr" then
       begin(op)
     else
+      stage(op, "opening_session")
       local Terminal = require("sidekick.cli.terminal")
       local terminals_before = vim.tbl_extend("force", {}, Terminal.terminals)
       local sid = Session.sid({ tool = op.tool, cwd = op.cwd })
@@ -766,7 +825,25 @@ function M.new(opts)
       end
       finish(op, ok and "attached" or "failed", not ok and tostring(err) or nil)
     end
-  end)
+  end
+  -- Only a picker row showing this exact destination can replace confirmation.
+  -- Re-read primary policy during plan(); a changed destination must be confirmed.
+  if
+    type(confirmed) == "table"
+    and confirmed.name == op.tool
+    and confirmed.backend == op.backend
+    and confirmed.cwd == op.cwd
+  then
+    dispatch(op)
+  else
+    vim.ui.select({ op }, {
+      prompt = (op.backend == "tmux" or op.backend == "zellij") and "Open mux session (may reuse existing)?"
+        or "Create new agent?",
+      format_item = function()
+        return op.tool .. " via " .. op.backend .. " in " .. op.cwd
+      end,
+    }, dispatch)
+  end
   return op
 end
 
@@ -800,6 +877,8 @@ function M.refresh(id)
   if not vim.tbl_contains({ "unknown", "blocked", "ready", "cancelled" }, op.phase) then
     return op
   end
+  -- An explicit refresh resumes observation timing, including the user-time gap.
+  op._clock_end = nil
   op.phase = "checking_server"
   server(op, function()
     verify(op, false)

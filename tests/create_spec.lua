@@ -56,7 +56,7 @@ local function checked(fn)
 end
 local function respond(cmd)
   if cmd[1] == "--version" then
-    return result("herdr 0.9.5")
+    return state.version_error and result("", 1, "synthetic version failure") or result("herdr 0.9.5")
   end
   if cmd[1] == "session" then
     return result({ sessions = { { name = "poc", running = true, socket_path = "/tmp/mvp.sock" } } })
@@ -97,6 +97,9 @@ local function respond(cmd)
       foreground_process_group_id = state.started and not state.return_to_shell and vim.fn.getpid() or 1,
       foreground_processes = { { pid = 1, name = state.shell_name or "bash", cwd = root } },
     }
+    if state.root_cwd_missing then
+      info.foreground_processes[1].cwd = nil
+    end
     if state.null_process_entry then
       info.foreground_processes = { vim.NIL }
     end
@@ -105,7 +108,13 @@ local function respond(cmd)
     end
     if state.shell_children and state.shell_children > 0 then
       state.shell_children = state.shell_children - 1
-      table.insert(info.foreground_processes, { pid = 2, name = "starship", cwd = root })
+      local child = { pid = 2, name = "bash", cwd = root }
+      if state.child_missing_cwd and (state.shell_children == 0 or state.child_missing_always) then
+        child.cwd = nil
+      elseif state.child_wrong_cwd then
+        child.cwd = "/different-startup-directory"
+      end
+      table.insert(info.foreground_processes, child)
     end
     return result({ result = { process_info = info } })
   elseif a[1] == "pane" and a[2] == "read" then
@@ -669,6 +678,39 @@ T["shell prompt rendering subprocesses settle before any input"] = function()
   expect.equality(op.phase, "attached")
   expect.equality(count("workspace", "create"), 1)
   expect.equality(count("agent", "start"), 1)
+end
+
+T["startup child disappearing between process and cwd reads is passively retried"] = function()
+  state.shell_children, state.child_missing_cwd = 2, true
+  local op = Create.new({ name = "codex" })
+  expect.equality(Create.new({ name = "codex" }), op)
+  wait(op)
+  expect.equality(op.phase, "attached")
+  expect.equality(state.shell_children, 0)
+  expect.equality(count("workspace", "create"), 1)
+  expect.equality(count("agent", "start"), 1)
+  expect.equality(count("pane", "process-info") >= 3, true)
+  expect.equality(Create.refresh(op.id), op)
+  expect.equality(count("agent", "start"), 1)
+end
+
+T["unknown child cwd never permits input while children persist"] = function()
+  state.shell_children, state.child_missing_cwd, state.child_missing_always = 25, true, true
+  local op = wait(Create.new({ name = "codex" }))
+  expect.equality(op.phase, "unknown")
+  expect.equality(op.error:find("Timed out waiting for shell startup", 1, true) ~= nil, true)
+  expect.equality(count("pane", "run"), 0)
+  expect.equality(count("agent", "start"), 0)
+  expect.equality(Create.new({ name = "codex" }), op)
+  expect.equality(count("workspace", "create"), 1)
+end
+
+T["known wrong child cwd still refuses input"] = function()
+  state.shell_children, state.child_wrong_cwd = 2, true
+  local op = wait(Create.new({ name = "codex" }))
+  expect.equality(op.phase, "unknown")
+  expect.equality(count("pane", "run"), 0)
+  expect.equality(count("agent", "start"), 0)
 end
 
 T["tool selection pins cwd before its asynchronous callback"] = function()
@@ -1791,6 +1833,281 @@ for _, mode in ipairs({ "window", "split" }) do
   end
 end
 
+for _, case in ipairs({
+  { label = "explicit primary, unset", primary = "herdr", allowed = true },
+  { label = "explicit primary, false", primary = "herdr", enabled = false, allowed = false },
+  { label = "explicit primary, true", primary = "herdr", enabled = true, allowed = true },
+  { label = "legacy routing, unset", allowed = false },
+  { label = "legacy routing, false", enabled = false, allowed = false },
+  { label = "legacy routing, true", enabled = true, allowed = true },
+}) do
+  T["herdr creation opt-in: " .. case.label] = function()
+    Config.cli.primary_backend = case.primary
+    Config.cli.mux.backend = "herdr"
+    Config.cli.mux.herdr.create.enabled = case.enabled
+    local ok, op = pcall(Create.new, { name = "codex" })
+    expect.equality(ok, case.allowed)
+    if case.allowed then
+      wait(op)
+      expect.equality(op.phase, "attached")
+      expect.equality(count("workspace", "create"), 1)
+      expect.equality(count("agent", "start"), 1)
+    else
+      expect.equality(tostring(op):find("Herdr creation is disabled", 1, true) ~= nil, true)
+      expect.equality(count("workspace", "create"), 0)
+      expect.equality(Create.operations, {})
+    end
+  end
+end
+
+T["herdr creation false does not disable a non-herdr primary"] = function()
+  Config.cli.primary_backend = "terminal"
+  Config.cli.mux.herdr.create.enabled = false
+  Session.register("terminal", Terminal)
+  Session.attach = function()
+    return {
+      show = function() end,
+      is_running = function()
+        return true
+      end,
+    }
+  end
+  local op = Create.new({ name = "codex" })
+  expect.equality(op.phase, "attached")
+  expect.equality(op.backend, "terminal")
+  expect.equality(calls, {})
+end
+
+T["invalid enabled value is rejected before planning or dispatch"] = function()
+  Config.cli.mux.herdr.create.enabled = "false"
+  local ok, why = pcall(Create.new, { name = "codex" })
+  expect.equality(ok, false)
+  expect.equality(tostring(why):find("expected boolean", 1, true) ~= nil, true)
+  expect.equality(Create.operations, {})
+  expect.equality(calls, {})
+end
+
+for _, focus in ipairs({ true, false }) do
+  T["optimized create uses 17 core CLI calls with single presentation: " .. tostring(focus)] = function()
+    local shown, focused = 0, 0
+    Session.attach = function()
+      local terminal = {}
+      terminal.show = function()
+        shown = shown + 1
+      end
+      terminal.focus = function()
+        focused = focused + 1
+        terminal:show()
+      end
+      return terminal
+    end
+    local op = wait(Create.new({ name = "codex", focus = focus }))
+    expect.equality(op.phase, "attached")
+    expect.equality(#calls, 17)
+    expect.equality(count("api", "snapshot"), 0)
+    expect.equality(count("status", "server"), 3)
+    expect.equality(shown, 1)
+    expect.equality(focused, focus and 1 or 0)
+  end
+
+  T["optimized attachment models 29 CLI calls with owner checks: " .. tostring(focus)] = function()
+    Session.attach = function(source)
+      -- Model the two real pre-attachment checks, without a terminal job.
+      expect.equality(source:validate(), true)
+      expect.equality(source:validate(), true)
+      local terminal = {}
+      terminal.show = function()
+        expect.equality(source:validate(), true)
+      end
+      terminal.focus = function()
+        terminal:show()
+      end
+      return terminal
+    end
+    local op = wait(Create.new({ name = "codex", focus = focus }))
+    expect.equality(op.phase, "attached")
+    expect.equality(#calls, 29)
+    expect.equality(count("api", "snapshot"), 0)
+    expect.equality(count("workspace", "create"), 1)
+    expect.equality(count("agent", "start"), 1)
+  end
+end
+
+T["failed local version probe cannot create or retry"] = function()
+  state.version_error = true
+  local op = wait(Create.new({ name = "codex" }))
+  expect.equality(op.phase, "failed")
+  expect.equality(op.error:find("herdr --version failed", 1, true) ~= nil, true)
+  expect.equality(count("status", "server"), 0)
+  expect.equality(count("workspace", "create"), 0)
+  expect.equality(count("agent", "start"), 0)
+end
+
+T["journal timings exclude confirmation and contain fixed stages and CLI durations"] = function()
+  local confirm
+  vim.ui.select = function(_, _, cb)
+    confirm = cb
+  end
+  Config.cli.tools.codex.env = { PERF_SECRET = "private-timing-fixture" }
+  local op = Create.new({ name = "codex" })
+  local planned = vim.json.decode(table.concat(vim.fn.readfile(op.journal), "\n"))
+  expect.equality(planned.elapsed_ms, 0)
+  expect.equality(planned.timings, {})
+  local system = vim.system
+  vim.system = function(cmd, opts, cb)
+    if cb and cmd[4] == "agent" and cmd[5] == "start" then
+      return system(cmd, opts, function(value)
+        vim.defer_fn(function()
+          cb(value)
+        end, 20)
+      end)
+    end
+    return system(cmd, opts, cb)
+  end
+  confirm(op)
+  wait(op)
+  local saved = vim.json.decode(table.concat(vim.fn.readfile(op.journal), "\n"))
+  expect.equality(saved.elapsed_ms >= 10, true)
+  expect.equality(
+    vim.tbl_map(function(t)
+      return t.stage
+    end, saved.timings),
+    {
+      "preflight",
+      "creating_workspace",
+      "shell_before_probe",
+      "executable_probe",
+      "shell_before_start",
+      "starting_agent",
+      "verifying_agent",
+      "attaching",
+    }
+  )
+  expect.equality(saved.timings[1].elapsed_ms, 0)
+  for _, t in ipairs(saved.timings) do
+    expect.equality(t.duration_ms >= 0, true)
+    expect.equality(vim.tbl_count(t), 3)
+  end
+  for _, record in ipairs(saved.records) do
+    expect.equality(type(record.duration_ms), "number")
+    expect.equality(record.duration_ms >= 0, true)
+    if record.command == "agent start" then
+      expect.equality(record.duration_ms >= 10, true) -- 20ms injected callback, with timer granularity tolerance.
+    end
+  end
+  expect.equality(vim.json.encode(saved.timings):find("private-timing-fixture", 1, true), nil)
+end
+
+T["cancelled timings remain bounded and late replies never restart creation"] = function()
+  state.hold = "workspace create"
+  local op = Create.new({ name = "codex" })
+  expect.equality(
+    vim.wait(1000, function()
+      return #held == 1
+    end),
+    true
+  )
+  expect.equality(Create.new({ name = "codex" }), op)
+  Create.cancel(op.id)
+  local cancelled = vim.json.decode(table.concat(vim.fn.readfile(op.journal), "\n"))
+  expect.equality(cancelled.phase, "cancelled")
+  expect.equality(cancelled.elapsed_ms >= 0, true)
+  local elapsed = cancelled.elapsed_ms
+  held[1]()
+  expect.equality(
+    vim.wait(1000, function()
+      return op.workspace ~= nil
+    end),
+    true
+  )
+  local late = vim.json.decode(table.concat(vim.fn.readfile(op.journal), "\n"))
+  expect.equality(late.phase, "cancelled")
+  expect.equality(late.elapsed_ms, elapsed)
+  expect.equality(count("workspace", "create"), 1)
+  expect.equality(count("pane", "run"), 0)
+  expect.equality(count("agent", "start"), 0)
+  for _, t in ipairs(late.timings) do
+    expect.equality(t.duration_ms >= 0, true)
+  end
+end
+
+T["late startup observation keeps cancelled clock frozen until explicit refresh"] = function()
+  state.hold = "agent start"
+  local op = Create.new({ name = "codex" })
+  expect.equality(
+    vim.wait(2000, function()
+      return #held == 1
+    end),
+    true
+  )
+  Create.cancel(op.id)
+  local frozen = vim.json.decode(table.concat(vim.fn.readfile(op.journal), "\n"))
+  vim.wait(20, function()
+    return false
+  end)
+  held[1]()
+  expect.equality(
+    vim.wait(2000, function()
+      return op.phase == "ready"
+    end),
+    true
+  )
+  local late = vim.json.decode(table.concat(vim.fn.readfile(op.journal), "\n"))
+  expect.equality(late.elapsed_ms, frozen.elapsed_ms)
+  expect.equality(late.timings, frozen.timings)
+  expect.equality(#attached, 0)
+  expect.equality(count("agent", "start"), 1)
+  local start_record = vim.tbl_filter(function(record)
+    return record.command == "agent start"
+  end, late.records)[1]
+  expect.equality(start_record.duration_ms >= 10, true)
+  vim.wait(20, function()
+    return false
+  end)
+  Create.refresh(op.id)
+  expect.equality(
+    vim.wait(2000, function()
+      return op.phase == "ready"
+    end),
+    true
+  )
+  local refreshed = vim.json.decode(table.concat(vim.fn.readfile(op.journal), "\n"))
+  expect.equality(refreshed.elapsed_ms >= frozen.elapsed_ms + 20, true)
+  expect.equality(vim.list_slice(refreshed.timings, 1, #frozen.timings), frozen.timings)
+  expect.equality(#refreshed.timings, #frozen.timings + 1)
+  expect.equality(refreshed.timings[#refreshed.timings].stage, "verifying_agent")
+  expect.equality(count("workspace", "create"), 1)
+  expect.equality(count("agent", "start"), 1)
+  expect.equality(#attached, 0)
+end
+
+T["unknown child cwd waits without input until the verified shell is alone"] = function()
+  state.shell_children, state.child_missing_cwd, state.hold = 1, true, "pane process-info"
+  local op = Create.new({ name = "codex" })
+  expect.equality(
+    vim.wait(2000, function()
+      return #held == 1
+    end),
+    true
+  )
+  expect.equality(count("pane", "run"), 0)
+  expect.equality(count("agent", "start"), 0)
+  state.hold = nil
+  held[1]()
+  wait(op)
+  expect.equality(op.phase, "attached")
+  expect.equality(count("pane", "process-info") >= 2, true)
+  expect.equality(count("agent", "start"), 1)
+end
+
+T["unknown child cwd never substitutes for the root shell cwd"] = function()
+  state.shell_children, state.child_missing_cwd, state.root_cwd_missing = 1, true, true
+  local op = wait(Create.new({ name = "codex" }))
+  expect.equality(op.phase, "unknown")
+  expect.equality(count("pane", "run"), 0)
+  expect.equality(count("agent", "start"), 0)
+end
+
 local function selector()
   local pickers = {}
   vim.ui.select = function(items, opts, cb)
@@ -1799,7 +2116,22 @@ local function selector()
   return pickers
 end
 
-T["selector New confirms herdr even with legacy tmux and an existing same-cwd source"] = function()
+T["implicit opt-in never creates during discovery or unselected New"] = function()
+  Config.cli.mux.herdr.create.enabled = nil
+  Config.cli.mux.backend = "herdr"
+  Session.sessions()
+  local pickers = selector()
+  require("sidekick.cli").select({ auto = true, filter = { name = "codex" } })
+  expect.equality(#pickers, 1)
+  expect.equality(pickers[1].items[1].new, true)
+  expect.equality(Create.operations, {})
+  pickers[1].cb(nil)
+  expect.equality(count("workspace", "create"), 0)
+  expect.equality(count("agent", "start"), 0)
+  expect.equality(count("pane", "run"), 0)
+end
+
+T["selector explicit New dispatches once without duplicate confirmation"] = function()
   Config.cli.mux.backend, Config.cli.mux.enabled = "tmux", true
   local provider = {
     priority = 50,
@@ -1826,12 +2158,9 @@ T["selector New confirms herdr even with legacy tmux and an existing same-cwd so
   expect.equality(action.cwd, root)
   expect.equality(require("sidekick.cli.ui.select").format(action)[1][1]:find("via herdr", 1, true) ~= nil, true)
   pickers[1].cb(action)
-  local op = pickers[2].items[1]
-  expect.equality(op.phase, "confirming")
-  expect.equality(count("workspace", "create"), 0)
+  local op = vim.tbl_values(Create.operations)[1]
   pickers[1].cb(action) -- Duplicate selection reuses the reserved operation, not another dispatch.
-  expect.equality(#pickers, 2)
-  pickers[2].cb(op)
+  expect.equality(#pickers, 1)
   wait(op)
   expect.equality(op.phase, "attached")
   expect.equality(count("workspace", "create"), 1)
@@ -1839,27 +2168,53 @@ T["selector New confirms herdr even with legacy tmux and an existing same-cwd so
   expect.equality(callbacks, { false, false }) -- Pending attach/send payload never reaches the new agent.
 end
 
-T["selector New pins cwd and cancellation leaves each cwd independently available"] = function()
+T["selector New pins cwd before immediate dispatch"] = function()
   local pickers = selector()
   require("sidekick.cli").select({ filter = { name = "codex" } })
   local action = pickers[1].items[#pickers[1].items]
   vim.fn.mkdir(root .. "/other", "p")
   vim.fn.chdir(root .. "/other")
   pickers[1].cb(action)
-  local first = pickers[2].items[1]
+  local first = vim.tbl_values(Create.operations)[1]
   expect.equality(first.cwd, root)
+  expect.equality(#pickers, 1)
+  wait(first)
+  expect.equality(first.phase, "attached")
+end
+
+T["selector destination change requires confirmation again"] = function()
+  local pickers = selector()
   require("sidekick.cli").select({ filter = { name = "codex" } })
-  pickers[3].cb(pickers[3].items[#pickers[3].items])
-  local second = pickers[4].items[1]
-  expect.equality(second.cwd, root .. "/other")
-  expect.equality(first.key ~= second.key, true)
+  local action = pickers[1].items[#pickers[1].items]
+  Config.cli.primary_backend = "terminal"
+  Session.register("terminal", Terminal)
+  pickers[1].cb(action)
+  expect.equality(#pickers, 2)
+  expect.equality(pickers[2].items[1].backend, "terminal")
+  expect.equality(pickers[2].items[1].phase, "confirming")
   pickers[2].cb(nil)
-  pickers[4].cb(nil)
-  expect.equality(first.phase, "cancelled")
-  expect.equality(second.phase, "cancelled")
-  expect.equality(Create.pending[first.key], nil)
-  expect.equality(Create.pending[second.key], nil)
   expect.equality(count("workspace", "create"), 0)
+end
+
+T["selector named terminal New also uses the selected row as confirmation"] = function()
+  Config.cli.primary_backend = "terminal"
+  Session.register("terminal", Terminal)
+  local used
+  Session.attach = function(source)
+    used = source
+    return {
+      show = function() end,
+      is_running = function()
+        return true
+      end,
+    }
+  end
+  local pickers = selector()
+  require("sidekick.cli").select({ filter = { name = "codex" } })
+  pickers[1].cb(pickers[1].items[#pickers[1].items])
+  expect.equality(#pickers, 1)
+  expect.equality(used.backend, "terminal")
+  expect.equality(vim.tbl_values(Create.operations)[1].phase, "attached")
 end
 
 T["selector dismissal and disabled New never dispatch and report validation"] = function()
@@ -1880,12 +2235,11 @@ T["selector New startup failure is retained without retry or legacy fallback"] =
   require("sidekick.cli").select({ filter = { name = "codex" } })
   local action = pickers[1].items[#pickers[1].items]
   pickers[1].cb(action)
-  local op = pickers[2].items[1]
-  pickers[2].cb(op)
+  local op = vim.tbl_values(Create.operations)[1]
   wait(op)
   expect.equality(vim.tbl_contains({ "failed", "unknown", "blocked" }, op.phase), true)
   pickers[1].cb(action)
-  expect.equality(#pickers, 2)
+  expect.equality(#pickers, 1)
   expect.equality(count("workspace", "create"), 1)
   expect.equality(count("agent", "start"), 1)
 end
@@ -2024,10 +2378,9 @@ for _, enabled in ipairs({ false, true }) do
     pickers[1].cb(pickers[1].items[1])
     expect.equality(table.concat(notices):find("pending text was not sent", 1, true) ~= nil, true)
     if enabled then
-      expect.equality(#pickers, 2)
-      local op = pickers[2].items[1]
+      expect.equality(#pickers, 1)
+      local op = vim.tbl_values(Create.operations)[1]
       expect.equality(op.focus, false)
-      pickers[2].cb(op)
       wait(op)
       expect.equality(op.phase, "attached")
     else
@@ -2094,11 +2447,15 @@ for _, entry in ipairs({ "select", "show", "toggle", "focus", "send" }) do
           pickers[2].cb("codex")
           confirmation = 3
         end
-        local op = pickers[confirmation].items[1]
+        local op = filtered and vim.tbl_values(Create.operations)[1] or pickers[confirmation].items[1]
         local expected = entry == "focus" or intent.value ~= false
         expect.equality(op.focus ~= false, expected)
-        expect.equality(count("workspace", "create"), 0)
-        pickers[confirmation].cb(op)
+        if filtered then
+          expect.equality(#pickers, 1)
+        else
+          expect.equality(count("workspace", "create"), 0)
+          pickers[confirmation].cb(op)
+        end
         wait(op)
         expect.equality(op.phase, "attached")
         expect.equality(focus_count, expected and 1 or 0)

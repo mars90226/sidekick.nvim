@@ -35,13 +35,21 @@ if scoped:
     if len(args) < 3 or args[1] != state.get("session_name", "poc"):
         forbidden("wrong server")
     args = args[2:]
+pinned_read = not scoped and args in (["status", "server", "--json"], ["api", "snapshot"])
+if pinned_read:
+    if "HERDR_SESSION" in os.environ or not os.environ.get("HERDR_SOCKET_PATH"):
+        forbidden("terminal observation was not socket-pinned")
+    if os.environ["HERDR_SOCKET_PATH"] != state["socket"]:
+        print("mock socket unavailable", file=sys.stderr)
+        sys.exit(1)
 if args == ["--version"] and not scoped:
     print(state.get("client_version_output", "herdr 0.9.5"))
 elif args == ["session", "list", "--json"] and not scoped:
     reply({"sessions": state["sessions"]})
-elif args == ["status", "server", "--json"] and scoped:
-    reply({"socket": state["socket"], "running": state.get("server_running", True)})
-elif args == ["api", "snapshot"] and scoped:
+elif args == ["status", "server", "--json"] and (scoped or pinned_read):
+    reply({"socket": state["socket"], "running": state.get("server_running", True),
+           "version": state["snapshot"]["version"], "protocol": state["snapshot"].get("protocol", 22)})
+elif args == ["api", "snapshot"] and (scoped or pinned_read):
     if state.get("fail_snapshot"):
         if not state.get("empty_error"):
             print("synthetic snapshot access denied", file=sys.stderr)

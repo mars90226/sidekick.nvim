@@ -70,7 +70,7 @@ getmetatable(T).opts.hooks = {
       socket = root .. "/mock.sock",
       process_group = vim.fn.getpid(),
       sessions = { { name = "poc", running = true, socket_path = root .. "/mock.sock" } },
-      snapshot = { version = "0.9.5", agents = {} },
+      snapshot = { version = "0.9.5", protocol = 22, agents = {}, panes = {} },
     }
     for i = 1, 2 do
       state.snapshot.agents[i] = {
@@ -83,6 +83,7 @@ getmetatable(T).opts.hooks = {
         agent_session = { agent = "codex", kind = "id", source = "mock", value = "native-" .. i },
       }
     end
+    state.snapshot.panes = vim.deepcopy(state.snapshot.agents)
     save(state)
     Config.cli.mux.backend, Config.cli.mux.herdr, Config.cli.watch = "herdr", { session = "poc" }, false
     Session.backends, Session.did_setup, Session._attached, Terminal.terminals = {}, true, {}, {}
@@ -119,8 +120,13 @@ getmetatable(T).opts.hooks = {
     for _, argv in ipairs(history) do
       local global_read = vim.deep_equal(argv, { "--version" }) or vim.deep_equal(argv, { "session", "list", "--json" })
       local pinned_attach = #argv == 3 and argv[1] == "terminal" and argv[2] == "attach"
+      local pinned_read = vim.deep_equal(argv, { "status", "server", "--json" })
+        or vim.deep_equal(argv, { "api", "snapshot" })
       expect.equality(
-        global_read or pinned_attach or (argv[1] == "--session" and argv[2] == (state.session_name or "poc")),
+        global_read
+          or pinned_attach
+          or pinned_read
+          or (argv[1] == "--session" and argv[2] == (state.session_name or "poc")),
         true
       )
       expect.equality(vim.tbl_contains(argv, "--takeover"), false)
@@ -390,6 +396,47 @@ T["disconnect retires wrapper without restart and permits explicit reselection"]
   ready(replacement)
   expect.no_equality(replacement.job, job)
   expect.equality(replacement.source_id, sessions[1].id)
+end
+
+T["target removal reports neutral lifecycle once through real mock PTY cleanup"] = function()
+  local t = attach()
+  ready(t)
+  state.snapshot.agents, state.snapshot.panes = {}, {}
+  save(state)
+  vim.fn.jobstop(t.job) -- Only this test's owned fake attach client.
+  vim.fn.jobwait({ t.job }, 1000)
+  expect.equality(
+    vim.wait(1000, function()
+      return t.closed == true
+    end),
+    true
+  )
+  expect.equality(#errors, 0)
+  expect.equality(#warnings, 1)
+  expect.equality(warnings[1]:find("target terminal has ended or been removed", 1, true) ~= nil, true)
+  expect.equality(warnings[1]:find("agent exit status unknown", 1, true) ~= nil, true)
+  t:report_exit(1)
+  expect.equality(#warnings, 1)
+  expect.equality(Terminal.get(t.id), nil)
+end
+
+T["failed snapshot after mock PTY disconnect retains failure and local cleanup"] = function()
+  local t = attach()
+  ready(t)
+  state.fail_snapshot = true
+  save(state)
+  vim.fn.jobstop(t.job)
+  vim.fn.jobwait({ t.job }, 1000)
+  expect.equality(
+    vim.wait(1000, function()
+      return t.closed == true
+    end),
+    true
+  )
+  expect.equality(#errors, 1)
+  expect.equality(#warnings, 0)
+  expect.equality(errors[1]:find("synthetic snapshot access denied", 1, true) ~= nil, true)
+  expect.equality(Terminal.get(t.id), nil)
 end
 
 T["discovery diagnostics are deduplicated without local fallback"] = function()
