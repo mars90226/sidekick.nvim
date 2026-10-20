@@ -29,7 +29,8 @@ function M.select(opts)
         Util.warn("New cancels this send; the pending text was not sent. Re-enter it after attaching.")
       end
       opts.cb(nil) -- Cancel the original attach/send action; New never submits its payload.
-      local ok, err = pcall(require("sidekick.cli").new, { name = state.name, cwd = state.cwd, focus = opts.focus })
+      local ok, err =
+        pcall(require("sidekick.cli.create").new, { name = state.name, cwd = state.cwd, focus = opts.focus }, state)
       if not ok then
         Util.error(tostring(err))
       end

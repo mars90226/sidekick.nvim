@@ -506,12 +506,32 @@ function M:report_exit(status)
     return line:match("%S") ~= nil
   end, lines)
   local tail = table.concat(vim.list_slice(lines, math.max(1, #lines - 2)), "\n"):sub(-800)
-  Util.error(
-    "Herdr attach client ended (status "
-      .. tostring(self.exit_status or "unknown")
-      .. "); select the existing agent again"
-      .. (tail ~= "" and (":\n" .. tail) or "")
-  )
+  local parent = self.parent
+  local present, reason
+  if parent and type(parent.terminal_present) == "function" then
+    local ok, value, detail = pcall(parent.terminal_present, parent)
+    if ok then
+      present, reason = value, detail
+    else
+      reason = tostring(value)
+    end
+  end
+  local message = "Herdr attach client ended (status " .. tostring(self.exit_status or "unknown") .. ")"
+  if present == false then
+    -- Preserve the nonzero client status and diagnostics. A healthy snapshot
+    -- proves current absence, not a successful agent exit or the failure cause.
+    message = message .. "; target terminal has ended or been removed (agent exit status unknown)"
+  elseif reason then
+    message = message .. "; terminal state unavailable: " .. reason
+  else
+    message = message .. "; inspect the server and target before reattaching"
+  end
+  message = message .. (tail ~= "" and (":\n" .. tail) or "")
+  if present == false then
+    Util.warn(message)
+  else
+    Util.error(message)
+  end
 end
 
 function M:close()

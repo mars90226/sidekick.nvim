@@ -29,10 +29,20 @@ local function fail(message)
   return {}
 end
 
-function M.json(args, session)
+function M.json(args, session, socket)
   local cmd = session and M.command(args, session) or vim.list_extend({ "herdr" }, args)
+  local opts = { text = true, timeout = 1500 }
+  if socket then
+    cmd = vim.list_extend({ "herdr" }, args)
+    -- vim.system stringifies false env values; remove the inherited session
+    -- explicitly so socket selection cannot be superseded by session routing.
+    opts.env = vim.fn.environ()
+    opts.env.HERDR_SESSION = nil
+    opts.env.HERDR_SOCKET_PATH = socket
+    opts.clear_env = true
+  end
   local ok, result = pcall(function()
-    return vim.system(cmd, { text = true, timeout = 1500 }):wait()
+    return vim.system(cmd, opts):wait()
   end)
   if not ok or result.code ~= 0 then
     local detail
@@ -90,8 +100,8 @@ function M.endpoint()
 end
 
 -- Refuse unknown status output instead of guessing the answering server.
-function M.server_matches(endpoint)
-  local status = M.json({ "status", "server", "--json" }, endpoint.name)
+function M.server_matches(endpoint, pinned, expected)
+  local status = M.json({ "status", "server", "--json" }, endpoint.name, pinned and endpoint.socket or nil)
   local sockets = {}
   local function walk(value)
     for key, child in pairs(value) do
@@ -106,17 +116,34 @@ function M.server_matches(endpoint)
     walk(status)
   end
   local matches = status and status.running == true and sockets[endpoint.socket] == true and vim.tbl_count(sockets) == 1
+  if matches and expected then
+    matches = status.protocol == expected.protocol and status.version == expected.version
+  end
   if not matches and not M._command_error then
     M._command_error = "server is not running or its socket identity did not match"
   end
-  return matches
+  return matches, status
 end
 
-function M.snapshot(endpoint)
-  if not M.server_matches(endpoint) then
+-- Read only the local binary version; no server lookup or long-lived cache.
+function M.client_version()
+  local ok, result = pcall(function()
+    return vim.system({ "herdr", "--version" }, { text = true, timeout = 1500 }):wait()
+  end)
+  local version = ok and result.code == 0 and (result.stdout or ""):match("herdr%s+(%S+)") or nil
+  if not present(version) then
+    M._command_error = "herdr --version failed or returned no recognizable version"
     return nil
   end
-  local reply = M.json({ "api", "snapshot" }, endpoint.name)
+  return version
+end
+
+function M.snapshot(endpoint, pinned)
+  local matches, status = M.server_matches(endpoint, pinned)
+  if not matches then
+    return nil
+  end
+  local reply = M.json({ "api", "snapshot" }, endpoint.name, pinned and endpoint.socket or nil)
   local snapshot = reply and type(reply.result) == "table" and reply.result.snapshot
   if type(snapshot) ~= "table" or type(snapshot.agents) ~= "table" or not vim.islist(snapshot.agents) then
     M._command_error = M._command_error or "server returned an invalid snapshot"
@@ -126,19 +153,59 @@ function M.snapshot(endpoint)
     M._command_error = "server snapshot is missing its version"
     return nil
   end
-  local ok, result = pcall(function()
-    return vim.system({ "herdr", "--version" }, { text = true, timeout = 1500 }):wait()
-  end)
   -- Direct attach uses the binary protocol, unlike JSON API discovery.
-  local client_version = ok and result.code == 0 and (result.stdout or ""):match("herdr%s+(%S+)") or nil
-  if not present(client_version) then
-    M._command_error = "herdr --version failed or returned no recognizable version"
+  local client_version = M.client_version()
+  if not client_version then
     return nil
   elseif client_version ~= snapshot.version then
     M._command_error = "client version " .. client_version .. " differs from server version " .. snapshot.version
     return nil
   end
+  if pinned and (status.protocol ~= snapshot.protocol or status.version ~= snapshot.version) then
+    M._command_error = "server protocol/version changed during terminal query"
+    return nil
+  end
   return snapshot
+end
+
+-- Observe only the original socket. Never use --session (which can create a server)
+-- or agent absence as evidence that the terminal ended. This is current state,
+-- not proof of an exit code or the cause of the attach client's failure.
+function M:terminal_present()
+  M._command_error = nil
+  if
+    type(self.endpoint) ~= "table"
+    or not present(self.endpoint.socket)
+    or type(self.binding) ~= "table"
+    or not present(self.binding.terminal)
+  then
+    return nil, "attachment has no pinned terminal/socket identity"
+  end
+  local snapshot = M.snapshot(self.endpoint, true)
+  if not snapshot then
+    return nil, M._command_error or "terminal snapshot unavailable"
+  end
+  if snapshot.protocol ~= 22 or type(snapshot.panes) ~= "table" or not vim.islist(snapshot.panes) then
+    return nil, "server returned an incomplete terminal snapshot"
+  end
+  local found, ids, panes = false, {}, {}
+  for _, pane in ipairs(snapshot.panes) do
+    if
+      type(pane) ~= "table"
+      or not present(pane.terminal_id)
+      or not present(pane.pane_id)
+      or ids[pane.terminal_id]
+      or panes[pane.pane_id]
+    then
+      return nil, "server returned an invalid terminal inventory"
+    end
+    ids[pane.terminal_id], panes[pane.pane_id] = true, true
+    found = found or pane.terminal_id == self.binding.terminal
+  end
+  if not M.server_matches(self.endpoint, true, snapshot) then
+    return nil, M._command_error or "server identity changed during terminal query"
+  end
+  return found
 end
 
 function M.binding(agent)

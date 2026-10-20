@@ -71,7 +71,9 @@ end
 --- Herdr creates a dedicated workspace. tmux/zellij may reuse an existing mux
 --- session with the same tool/cwd name. Non-herdr requests refuse sessions registered
 --- under this tool/cwd's Sidekick id; discovered panes can have different ids.
---- Select offers an explicit New action; choosing an existing session row only attaches.
+--- Select offers an explicit New action; a row naming tool/backend/cwd confirms creation.
+--- Tool-less New still confirms after tool selection. Direct new() always confirms.
+--- Choosing an existing session row only attaches.
 --- New never submits a pending send payload. Returned operations have id/phase/journal.
 --- on_done runs once for a newly planned operation. Dismissed tool pickers,
 --- raised validation errors and deduplicated calls do not invoke a new callback.
